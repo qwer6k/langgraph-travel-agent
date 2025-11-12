@@ -37,13 +37,12 @@ Production-ready LangGraph implementation for intelligent travel planning with m
 
 ## 📋 Table of Contents
 
-- [Quick Start](https://www.notion.so/2a8e936dcdf180c79125f02395eae0f8?pvs=21)
-- [Architecture](https://www.notion.so/2a8e936dcdf180c79125f02395eae0f8?pvs=21)
-- [API Setup](https://www.notion.so/2a8e936dcdf180c79125f02395eae0f8?pvs=21)
-- [Usage Examples](https://www.notion.so/2a8e936dcdf180c79125f02395eae0f8?pvs=21)
-- [Customization](https://www.notion.so/2a8e936dcdf180c79125f02395eae0f8?pvs=21)
-- [Deployment](https://www.notion.so/2a8e936dcdf180c79125f02395eae0f8?pvs=21)
-- [Contributing](https://www.notion.so/2a8e936dcdf180c79125f02395eae0f8?pvs=21)
+- [Quick Start]
+- [Architecture]
+- [API Setup]
+- [Usage Examples]
+- [Customization]
+- [Deployment]
 
 ---
 
