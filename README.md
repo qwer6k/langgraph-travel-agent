@@ -177,22 +177,22 @@ Intent Detection
       ├─ hotels_only ────┤                 │                   │
       └─ activities_only─┤                 │                   │
                          ↓                 ↓                   ↓
-              ┌─────────────────┐ ┌──────────────────┐ ┌─────────────────┐
+              ┌─────────────────┐ ┌──────────────────┐ ┌──────────────────┐
               │ search_flights  │ │ search_hotels    │ │ search_activities│
-              │                 │ │ ├─ Amadeus API   │ │                 │
-              │ Amadeus API     │ │ └─ Hotelbeds API │ │ Amadeus API     │
-              └────────┬────────┘ └────────┬─────────┘ └────────┬────────┘
+              │                 │ │ ├─ Amadeus API   │ │                  │
+              │ Amadeus API     │ │ └─ Hotelbeds API │ │ Amadeus API      │
+              └────────┬────────┘ └────────┬─────────┘ └─────────┬────────┘
                        │                   │                     │
                        └───────────────────┴─────────────────────┘
                                            ↓
                        [IF full_plan + budget exists]
                                            ↓
-                              ┌────────────────────────┐
+                              ┌─────────────────────────┐
                               │ generate_travel_packages│
-                              │ • Budget tier          │
-                              │ • Balanced tier        │
-                              │ • Premium tier         │
-                              └────────┬───────────────┘
+                              │ • Budget tier           │
+                              │ • Balanced tier         │
+                              │ • Premium tier          │
+                              └────────┬────────────────┘
                                        ↓
                               ┌─────────────────────┐
                               │ Final LLM Response  │
