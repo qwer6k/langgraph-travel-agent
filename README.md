@@ -709,7 +709,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📧 Support
 
-- **Email**: [Contact Me](mailto:2.harim.choi@gmail.com)
+- **Email**: [2.harim.choi@gmail.com](mailto:2.harim.choi@gmail.com)
 
 ---
 
