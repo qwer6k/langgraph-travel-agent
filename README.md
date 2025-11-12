@@ -8,6 +8,22 @@ Production-ready LangGraph implementation for intelligent travel planning with m
 
 ![LangGraph](https://img.shields.io/badge/LangGraph-0.2%2B-orange)
 
+## 🎬 Demo
+
+### Complex Trip Planning Example
+
+![Demo Screenshot](demo.png)
+
+**User Query:** "I'm planning a 4-day trip from Paris to New York..."
+
+**System Response:**
+- ✅ Triggers customer information form
+- 🔄 Parallel API calls to Amadeus (flights, hotels, activities)
+- 📦 Generates 3 budget-tiered packages
+- 💬 Natural language presentation
+
+[Try it live](#) | [Watch video demo](#)
+
 ## 🚀 Features
 
 ### Core Capabilities
