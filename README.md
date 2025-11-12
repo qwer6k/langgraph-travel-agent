@@ -65,7 +65,7 @@ Production-ready LangGraph implementation for intelligent travel planning with m
 ### Prerequisites
 
 - Python 3.9 or higher
-- API keys for required services (see [API Setup](https://www.notion.so/2a8e936dcdf180c79125f02395eae0f8?pvs=21))
+- API keys for required services (see [API Setup](#api-setup))
 
 ### Installation
 
@@ -606,7 +606,7 @@ async def test_package_generation():
 
 ## 📝 License
 
-This project is licensed under the MIT License - see the [LICENSE](https://www.notion.so/harim/LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
@@ -620,8 +620,6 @@ This project is licensed under the MIT License - see the [LICENSE](https://www.n
 
 ## 📧 Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/travel-agent/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/travel-agent/discussions)
 - **Email**: [2.harim.choi@gmail.com](mailto:your-email@example.com)
 
 ---
