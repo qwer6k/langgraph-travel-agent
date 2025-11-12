@@ -22,8 +22,6 @@ Production-ready LangGraph implementation for intelligent travel planning with m
 - 📦 Generates 3 budget-tiered packages
 - 💬 Natural language presentation
 
-[Try it live](#) | [Watch video demo](#)
-
 ## 🚀 Features
 
 ### Core Capabilities
