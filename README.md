@@ -71,8 +71,8 @@ Production-ready LangGraph implementation for intelligent travel planning with m
 
 ```bash
 # Clone the repository
-git clone <https://github.com/yourusername/travel-agent.git>
-cd travel-agent
+git clone https://github.com/HarimxChoi/langgraph-travel-agent.git
+cd langgraph-travel-agent
 
 # Create virtual environment
 python -m venv venv
@@ -87,85 +87,174 @@ cp .env.example .env
 
 ```
 
-### Basic Usage
+### Quick Test
 
+**Option 1: Web Interface (Recommended)**
+1. Start both backend and frontend (see above)
+2. Navigate to http://localhost:3000
+3. Type: "Find me a flight from NYC to Paris next Monday"
+
+**Option 2: Python API (for developers)**
 ```python
 from agent_graph import build_enhanced_graph
 from langchain_core.messages import HumanMessage
 
-# Initialize the graph
 graph = build_enhanced_graph()
-
-# Run a query
 response = await graph.ainvoke({
-    'messages': [HumanMessage(content="Find me a 5-day trip to Paris for $2000")]
+    'messages': [HumanMessage(content="Find flights to Tokyo")]
 })
-
 print(response['messages'][-1].content)
-
 ```
 
 ---
 
 ## 🏗️ Architecture
 
-### System Overview
+### High-Level Flow
 
 ```
-User Request
-     ↓
-┌────────────────────────────────────────┐
-│  call_model_and_tools Node             │
-│  • Analyze request with LLM            │
-│  • Extract TravelPlan                  │
-│  • Prepare tool calls                  │
-│  • Execute in parallel                 │
-└────────────────────────────────────────┘
-     ↓
-┌────────────────────────────────────────┐
-│  synthesize_results Node               │
-│  • Parse tool results                  │
-│  • Generate packages                   │
-│  • Create final response               │
-│  • Send to CRM                         │
-└────────────────────────────────────────┘
-     ↓
-Final Response to User
+┌─────────────────────────────────────────────────┐
+│ User Request (Natural Language)                 │
+└─────────────────┬───────────────────────────────┘
+                  ↓
+┌─────────────────────────────────────────────────┐
+│ call_model_and_tools Node                       │
+│ • Extract TravelPlan with LLM                   │
+│ • Convert locations (city → codes)              │
+└─────────────────┬───────────────────────────────┘
+                  ↓
+         [Need Customer Info?]
+                  ├─ YES ─────────────────────┐
+                  │                           ↓
+                  │              ┌─────────────────────────┐
+                  │              │ Display Customer Form   │
+                  │              │ (HITL - Human in Loop)  │
+                  │              └─────────┬───────────────┘
+                  │                        ↓
+                  │              User Fills Form & Submits
+                  │                        ↓
+                  └─ NO ──────────> [Continuation=True]
+                                             ↓
+                  ┌──────────────────────────┴─────────────────┐
+                  │ Parallel Tool Execution                    │
+                  ├─ Search Flights (Amadeus)                  │
+                  ├─ Search Hotels (Amadeus + Hotelbeds)       │
+                  └─ Search Activities (Amadeus)               │
+                  └──────────────────┬─────────────────────────┘
+                                     ↓
+                  ┌─────────────────────────────────────────────┐
+                  │ synthesize_results Node                     │
+                  │ • Parse all tool results                    │
+                  │ • Generate packages (if full_plan + budget) │
+                  │ • Create final LLM response                 │
+                  │ • Send to CRM (HubSpot)                     │
+                  └─────────────────┬───────────────────────────┘
+                                     ↓
+                  ┌─────────────────────────────────────────────┐
+                  │ Final Response to User                      │
+                  └─────────────────────────────────────────────┘
 
 ```
+
+**Key Components:**
+
+1. **Human-in-the-Loop (HITL)**: Triggers customer info form mid-conversation
+2. **Parallel Execution**: All API calls run simultaneously for speed
+3. **Multi-Provider Search**: Hotels queried from both Amadeus + Hotelbeds
+4. **Intelligent Packaging**: LLM generates Budget/Balanced/Premium packages when budget provided
+5. **CRM Integration**: Auto-sends finalized plans to HubSpot
 
 ### Tool Execution Flow
 
 ```
-Travel Request → LLM Analysis → Intent Detection
-                                      ↓
-                    ┌─────────────────┼─────────────────┐
-                    ↓                 ↓                 ↓
-              Search Flights    Search Hotels    Search Activities
-                    ↓                 ↓                 ↓
-              Amadeus API       Amadeus + Hotelbeds    Amadeus API
-                    └─────────────────┬─────────────────┘
-                                      ↓
-                              Package Generation
-                                      ↓
-                              Final Response
+Travel Request
+      ↓
+LLM Analysis (Extract TravelPlan)
+      ↓
+Intent Detection
+      ├─ full_plan ──────┬─────────────────┬───────────────────┐
+      ├─ flights_only ───┤                 │                   │
+      ├─ hotels_only ────┤                 │                   │
+      └─ activities_only─┤                 │                   │
+                         ↓                 ↓                   ↓
+              ┌─────────────────┐ ┌──────────────────┐ ┌─────────────────┐
+              │ search_flights  │ │ search_hotels    │ │ search_activities│
+              │                 │ │ ├─ Amadeus API   │ │                 │
+              │ Amadeus API     │ │ └─ Hotelbeds API │ │ Amadeus API     │
+              └────────┬────────┘ └────────┬─────────┘ └────────┬────────┘
+                       │                   │                     │
+                       └───────────────────┴─────────────────────┘
+                                           ↓
+                       [IF full_plan + budget exists]
+                                           ↓
+                              ┌────────────────────────┐
+                              │ generate_travel_packages│
+                              │ • Budget tier          │
+                              │ • Balanced tier        │
+                              │ • Premium tier         │
+                              └────────┬───────────────┘
+                                       ↓
+                              ┌─────────────────────┐
+                              │ Final LLM Response  │
+                              └─────────────────────┘
 
 ```
+**Tool Triggers by Intent:**
+- `full_plan` → Flights + Hotels + Activities
+- `flights_only` → Flights
+- `hotels_only` → Hotels  
+- `activities_only` → Activities
 
 ### State Management
 
-```python
-TravelAgentState:
-├── messages: Conversation history
-├── travel_plan: Structured trip details
-├── customer_info: Contact & budget
-├── current_step: Workflow stage
-├── form_to_display: UI control
-└── is_continuation: Session tracking
+**Core State Fields:**
 
-```
+| Field | Type | Purpose |
+|-------|------|---------|
+| `messages` | `List[AnyMessage]` | Full conversation history (auto-accumulated) |
+| `travel_plan` | `TravelPlan` | Structured trip extracted by LLM (origin, destination, dates, budget, intent) |
+| `customer_info` | `Dict` | User details from HITL form (name, email, phone, budget) |
+| `current_step` | `str` | Workflow stage: `"initial"` → `"collecting_info"` → `"synthesizing"` → `"complete"` |
+| `form_to_display` | `str` | UI trigger: `"customer_info"` signals frontend to show form |
+| `is_continuation` | `bool` | Session flag: `True` after form submission to bypass re-collection |
+| `original_request` | `str` | First user message preserved for CRM context |
+
+**Unused (Reserved for Extensions):**
+- `user_preferences`: For future personalization
+- `errors`: For error accumulation patterns
+- `trip_details`: For additional metadata
 
 ---
+### Frontend Setup
+```bash
+cd frontend/travel-widget
+
+# Install dependencies
+npm install
+
+# Configure API endpoint (if needed)
+echo "REACT_APP_API_URL=http://localhost:8000" > .env
+
+# Start development server
+npm start
+# React app runs on http://localhost:3000
+```
+
+### Running the Full Application
+
+**Terminal 1 - Backend:**
+```bash
+cd backend
+python main.py
+# Server runs on http://localhost:8000
+```
+
+**Terminal 2 - Frontend:**
+```bash
+cd frontend/travel-widget
+npm start
+# React app runs on http://localhost:3000
+```
 
 ## 🔑 API Setup
 
@@ -174,7 +263,7 @@ TravelAgentState:
 ### 1. Google Gemini (LLM)
 
 ```bash
-# Get your API key: <https://aistudio.google.com/app/apikey>
+# Get your API key: https://aistudio.google.com/app/apikey
 GOOGLE_API_KEY=your_key_here
 
 ```
@@ -620,7 +709,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📧 Support
 
-- **Email**: [2.harim.choi@gmail.com](mailto:your-email@example.com)
+- **Email**: [Contact Me](mailto:2.harim.choi@gmail.com)
 
 ---
 
