@@ -271,7 +271,7 @@ GOOGLE_API_KEY=your_key_here
 ### 2. Amadeus (Travel APIs)
 
 ```bash
-# Sign up: <https://developers.amadeus.com/register>
+# Sign up: https://developers.amadeus.com/register
 AMADEUS_API_KEY=your_key_here
 AMADEUS_API_SECRET=your_secret_here
 
@@ -282,7 +282,7 @@ AMADEUS_API_SECRET=your_secret_here
 ### 3. Hotelbeds (Enhanced Hotels)
 
 ```bash
-# Sign up: <https://developer.hotelbeds.com/>
+# Sign up: https://developer.hotelbeds.com/
 HOTELBEDS_API_KEY=your_key_here
 HOTELBEDS_API_SECRET=your_secret_here
 
@@ -291,7 +291,7 @@ HOTELBEDS_API_SECRET=your_secret_here
 ### 4. Twilio (SMS Notifications)
 
 ```bash
-# Get credentials: <https://www.twilio.com/console>
+# Get credentials: https://www.twilio.com/console
 TWILIO_ACCOUNT_SID=your_sid_here
 TWILIO_AUTH_TOKEN=your_token_here
 TWILIO_SENDER_PHONE=+1234567890
@@ -301,7 +301,7 @@ TWILIO_SENDER_PHONE=+1234567890
 ### 5. HubSpot (CRM - Default)
 
 ```bash
-# Get API key: <https://app.hubspot.com/integrations-settings/api-key>
+# Get API key: https://app.hubspot.com/integrations-settings/api-key
 HUBSPOT_API_KEY=your_key_here
 
 ```
@@ -417,7 +417,7 @@ async def send_to_crm(...):
     # Change API endpoint
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            "<https://yourinstance.salesforce.com/services/data/v58.0/sobjects/Opportunity>",
+            "https://yourinstance.salesforce.com/services/data/v58.0/sobjects/Opportunity",
             headers={"Authorization": f"Bearer {SALESFORCE_API_KEY}"},
             json={
                 "Name": f"AI Plan: {travel_plan.destination}",
@@ -434,7 +434,7 @@ async def send_to_crm(...):
 async def send_to_crm(...):
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"<https://api.pipedrive.com/v1/deals?api_token={PIPEDRIVE_API_KEY}>",
+            f"https://api.pipedrive.com/v1/deals?api_token={PIPEDRIVE_API_KEY}",
             json={
                 "title": f"AI Plan: {travel_plan.destination}",
                 "value": travel_plan.total_budget,
