@@ -130,7 +130,7 @@ How can I help you get started?
         setShowCustomerForm(false);
         setMessages(prev => [...prev.slice(0, -1), { type: 'bot', text: "Failed to get a response.", isError: true }]);
       }
-    }, 2500); 
+    }, 8000); 
   };
 
   const handleSendMessage = async (messageText = inputValue) => { 

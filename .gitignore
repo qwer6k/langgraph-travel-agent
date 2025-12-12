@@ -166,3 +166,12 @@ temp/
 
 # Test outputs
 test-output/
+
+# 前端依赖 - 使用精确路径
+frontend/travel-widget/node_modules/
+# 前端包锁文件 - 通常不建议提交
+frontend/travel-widget/package-lock.json
+frontend/travel-widget/yarn.lock
+# 通用的包锁文件（如果根目录也有）
+package-lock.json
+yarn.lock

@@ -10,7 +10,7 @@ from typing import Optional
 import uvicorn
 from langchain_core.messages import HumanMessage
 import uuid
-from agent_graph import build_enhanced_graph
+from backend.travel_agent import build_enhanced_graph 
 import asyncio
 
 # ============================================================================
@@ -90,30 +90,30 @@ async def run_agent_in_background(
     message: str,
     is_continuation: bool = False
 ):
-    """
-    Execute agent graph in background to prevent request timeout.
-    
-    Updates the global jobs dict with task status and results.
-    
-    Args:
-        task_id: Unique task identifier for status tracking
-        thread_id: Conversation thread ID for state persistence
-        message: User's input message
-        is_continuation: Whether this continues a previous conversation
-    """
     print(f"→ Background task {task_id} started (continuation: {is_continuation})")
-    
-    try:
-        # Configure thread persistence
-        config = {"configurable": {"thread_id": thread_id}}
 
-        # Prepare initial state
+    try:
+        # ============================================================
+        # 分离“对话 thread_id”和“graph checkpoint thread_id”
+        # - thread_id：用来存 customer_data（会话级别）
+        # - graph_thread_id：给 LangGraph 做 checkpoint 的 key（推理轮次级别）
+        #   - 续聊(is_continuation=True)：沿用 thread_id
+        #   - 新问题(is_continuation=False)：用 thread_id + task_id 组成一个新 key
+        # ============================================================
+        if is_continuation:
+            graph_thread_id = thread_id
+        else:
+            graph_thread_id = f"{thread_id}:{task_id}"
+
+        config = {"configurable": {"thread_id": graph_thread_id}}
+
+        # 初始 state：本轮用户消息 + 是否续聊
         initial_state = {
             "messages": [HumanMessage(content=message)],
-            "is_continuation": is_continuation
+            "is_continuation": is_continuation,
         }
-        
-        # Inject stored customer info if available
+
+        # 如果这个 thread_id 有客户信息，就注入到 state 里
         if thread_id in customer_data:
             initial_state["customer_info"] = customer_data[thread_id]
             initial_state["current_step"] = "info_collected"
@@ -121,32 +121,63 @@ async def run_agent_in_background(
         else:
             initial_state["current_step"] = "initial"
 
-        # Execute agent graph
+        # 调 LangGraph
         final_state = await agent_graph.ainvoke(initial_state, config)
-        
-        # Extract response
-        last_message = final_state['messages'][-1]
-        reply = str(last_message.content) if last_message.content else "I've processed the information."
-        
-        # Prepare result
+
+        # ============================================================
+        # 计算 reply
+        # ============================================================
+        reply = None
+        msgs = final_state.get("messages", [])
+
+        # 是否已经有“非 HumanMessage”的回复（ToolMessage / AIMessage）
+        has_non_human = any(not isinstance(m, HumanMessage) for m in msgs)
+
+        # ✅ 只有「当前这次调用的最终状态」还在 collecting_info，
+        #    且还没有任何机器人消息时，才给出“请先填写信息”的提示
+        if (
+            (not is_continuation)
+            and final_state.get("form_to_display") == "customer_info"
+            and final_state.get("current_step") == "collecting_info"
+            and not has_non_human
+        ):
+            reply = (
+                "✅ I have noted your travel needs.\n\n"
+                "Please fill in your contact information below (name, email, budget, etc.),"
+                "I will immediately search for suitable flights, hotels, and activities based on this information."
+            )
+        else:
+            # 其他情况：从最后往前找一条“非 HumanMessage”的消息作为回复
+            for msg in reversed(msgs):
+                if isinstance(msg, HumanMessage):
+                    continue
+                content = getattr(msg, "content", None)
+                if content:
+                    reply = str(content)
+                    break
+
+        # 兜底：实在没找到就给一个默认提示
+        if reply is None:
+            reply = "I've processed the information."
+
         result_data = {
             "status": "completed",
-            "result": {"reply": reply}
+            "result": {"reply": reply},
         }
-        
-        # Check if form needs to be displayed (human-in-the-loop)
-        if final_state.get('form_to_display'):
-            result_data["form_to_display"] = final_state['form_to_display']
-            
+
+        # form_to_display 仍然照旧返回，前端会用它决定是否弹窗
+        if final_state.get("form_to_display"):
+            result_data["form_to_display"] = final_state["form_to_display"]
+
         jobs[task_id] = result_data
         print(f"✓ Background task {task_id} completed")
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         jobs[task_id] = {
             "status": "failed",
-            "result": {"error": str(e)}
+            "result": {"error": str(e)},
         }
         print(f"✗ Background task {task_id} failed: {e}")
 
