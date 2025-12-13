@@ -237,7 +237,7 @@ class FlightSearchArgs(BaseModel):
     originLocationCode: str = Field(description="Departure city IATA code")
     destinationLocationCode: str = Field(description="Arrival city IATA code")
     departureDate: str = Field(description="Departure date (YYYY-MM-DD)")
-    returnDate: Optional[str] = Field(description="Return date (YYYY-MM-DD)")
+    returnDate: Optional[str] = Field(default=None, description="Return date (YYYY-MM-DD)")
     adults: int = Field(default=1, description="Number of adult passengers")
     currencyCode: str = Field(default="USD", description="Preferred currency")
 
@@ -609,7 +609,11 @@ async def _fallback_individual_hotel_search(
 
     if not amadeus:
         print("⚠ Amadeus client not initialized")
-        return []
+        return _hotel_error_placeholder(
+            "Amadeus",
+            "Amadeus client not initialized (fallback individual search).",
+        )
+
 
     offers: List[HotelOption] = []
     loop = asyncio.get_running_loop()
@@ -697,7 +701,11 @@ async def _search_amadeus_hotels(
             datetime.strptime(check_out_date, "%Y-%m-%d")
         except ValueError as e:
             print(f"✗ Invalid date format: {e}")
-            return []
+            return _hotel_error_placeholder(
+                "Input",
+                f"Invalid date format: {e}",
+            )
+
 
         try:
             offer_response = await loop.run_in_executor(
@@ -770,7 +778,11 @@ async def search_and_compare_hotels(
         actual_city_code = await flexible_city_code(amadeus, city_code)
     except ValueError as e:
         print(f"✗ Entry validation: {e}")
-        return []
+        return _hotel_error_placeholder(
+            "Input",
+            f"Invalid city_code: {e}",
+        )
+
 
     print(f"→ Hotel search: {city_code} → {actual_city_code}")
 
@@ -787,7 +799,15 @@ async def search_and_compare_hotels(
         adults,
     )
 
-    results = await asyncio.gather(amadeus_task, hotelbeds_task)
+    results = await asyncio.gather(amadeus_task, hotelbeds_task, return_exceptions=True)
+
+    combined_list: List[HotelOption] = []
+    for r in results:
+        if isinstance(r, Exception):
+            combined_list.extend(_hotel_error_placeholder("HotelSearch", f"Unexpected error: {r!r}"))
+        else:
+            combined_list.extend(r)
+
 
     combined_list: List[HotelOption] = []
     for result_list in results:

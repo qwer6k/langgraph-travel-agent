@@ -86,9 +86,6 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
         # ==============================
         # Phase 1: 解析 TravelPlan
         # ==============================
-        import re
-        from typing import Optional
-
         print("→ Phase 1: Analyzing request")
         travel_plan = await enhanced_travel_analysis(user_request)
 
@@ -97,42 +94,12 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             travel_plan.origin = "Shanghai"
             print("→ Origin not provided, defaulting to Shanghai")
 
-        def _parse_budget_to_float(raw: object) -> Optional[float]:
-            if raw is None:
-                return None
-            s = str(raw).strip()
-            if not s:
-                return None
-            s = s.upper().replace("USD", "").replace("$", "").replace(",", "").strip()
-            m = re.search(r"\d+(\.\d+)?", s)
-            if not m:
-                return None
-            try:
-                return float(m.group(0))
-            except ValueError:
-                return None
-
-        # ✅ 只有 full_plan（需要生成套餐）才注入预算；flights_only/hotels_only/activities_only 不需要
-        if travel_plan.user_intent == "full_plan":
-            raw_budget = customer_info.get("budget")
-            fallback_budget = _parse_budget_to_float(raw_budget)
-
-            need_budget = (travel_plan.total_budget is None or travel_plan.total_budget <= 0)
-
-            # 仅在 TravelPlan 没预算时兜底写回
-            if need_budget and (fallback_budget is not None and fallback_budget > 0):
-                travel_plan.total_budget = fallback_budget
-                print(f"→ Budget injected (fallback): ${travel_plan.total_budget}")
-            else:
-                # 有 customer budget 但不覆盖（保留用户话里解析到的预算）
-                if raw_budget:
-                    print(f"→ Budget NOT injected (keep parsed): {travel_plan.total_budget}")
-        else:
-            # 可选：打个日志，方便排查为什么不注入
-            if customer_info.get("budget"):
-                print(f"→ Budget skip (intent={travel_plan.user_intent})")
+        # ✅ Phase 1 不注入预算：预算只在“生成套餐”时才兜底
+        if customer_info.get("budget"):
+            print(f"→ Budget captured (not injected in analysis): {customer_info.get('budget')}")
 
         state["travel_plan"] = travel_plan
+
 
         # ==============================
         # Phase 2: 准备要调用的工具
@@ -178,12 +145,9 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             and travel_plan.origin
             and travel_plan.destination
         ):
-            # ✅ 用当前用户输入判断单程（优先 original_request，其次最后一条 message）
-            latest_user_text = (
-                state.get("original_request")
-                or state["messages"][-1].content
-                or ""
-            )
+            # ✅ 检测用户话里是否有“单程”意图
+            latest_user_text = (state["messages"][-1].content or state.get("original_request") or "")
+
             one_way = _is_one_way_request(latest_user_text)
 
             flight_args = {
@@ -258,20 +222,70 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
 
         processed_messages: List[ToolMessage] = []
 
+        def _tool_error_placeholder(tool_name: str, err: Exception) -> str:
+            """
+            将工具异常编码为“错误占位对象列表”，让 synthesize 能识别 is_error/error_message，
+            从而走到 flight/hotel/activity 的降级分支，而不是误判为“没结果”。
+            """
+            msg = f"{type(err).__name__}: {err}"
+            # 控制一下长度，避免把 traceback 塞进 prompt
+            msg = (msg[:500] + "…") if len(msg) > 500 else msg
+
+            if tool_name == "search_flights":
+                payload = [
+                    {
+                        "airline": "API_ERROR",
+                        "price": "N/A",
+                        "departure_time": "N/A",
+                        "arrival_time": "N/A",
+                        "duration": None,
+                        "is_error": True,
+                        "error_message": msg,
+                    }
+                ]
+            elif tool_name == "search_and_compare_hotels":
+                payload = [
+                    {
+                        "name": "API_ERROR",
+                        "category": "N/A",
+                        "price_per_night": "N/A",
+                        "source": "SYSTEM",
+                        "rating": None,
+                        "is_error": True,
+                        "error_message": msg,
+                    }
+                ]
+            elif tool_name == "search_activities_by_city":
+                payload = [
+                    {
+                        "name": "API_ERROR",
+                        "description": "Activity API error",
+                        "price": "N/A",
+                        "location": None,
+                        "is_error": True,
+                        "error_message": msg,
+                    }
+                ]
+            else:
+                # 未知工具也给个通用结构，至少能保留错误信息
+                payload = [{"is_error": True, "error_message": msg}]
+
+            return json.dumps(payload, ensure_ascii=False)
+
         for i, (task_coro, tool_name) in enumerate(tasks_and_names):
             print(f"→ [{i+1}/{len(tasks_and_names)}] Running tool: {tool_name}")
             try:
                 result = await task_coro
-            except Exception as e:
-                print(f"✗ Tool {tool_name} failed: {e}")
-                content = "[]"
-            else:
                 try:
                     # result 通常是 List[FlightOption]/List[HotelOption]/List[ActivityOption]
-                    content = json.dumps([item.model_dump() for item in result])
+                    content = json.dumps([item.model_dump() for item in result], ensure_ascii=False)
                 except Exception as e:
                     print(f"✗ Serialization failed for {tool_name}: {e}")
-                    content = "[]"
+                    content = _tool_error_placeholder(tool_name, e)
+
+            except Exception as e:
+                print(f"✗ Tool {tool_name} failed: {e}")
+                content = _tool_error_placeholder(tool_name, e)
 
             processed_messages.append(
                 ToolMessage(
@@ -281,9 +295,9 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
                 ),
             )
 
-            # 免费 Amadeus 环境比较“脆”，工具之间稍微歇一会，防止瞬间打爆 QPS
             if i < len(tasks_and_names) - 1:
                 await asyncio.sleep(1.2)
+
 
         print("✓ All tools executed")
         return {
@@ -313,6 +327,37 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
 
 
 
+import re
+from typing import Optional
+
+def _parse_budget_to_float(raw: object) -> Optional[float]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    s = s.upper().replace("USD", "").replace("$", "").replace(",", "").strip()
+    m = re.search(r"\d+(\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+def _ensure_budget_for_packages(travel_plan: TravelPlan, customer_info: dict) -> Optional[float]:
+    # 优先使用用户话里解析到的预算
+    if travel_plan.total_budget is not None and travel_plan.total_budget > 0:
+        return travel_plan.total_budget
+
+    # 兜底使用表单预算
+    fallback = _parse_budget_to_float(customer_info.get("budget"))
+    if fallback is not None and fallback > 0:
+        travel_plan.total_budget = fallback  # ✅ 只为生成套餐写回
+        return fallback
+
+    return None
+
 async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]: 
     """
     综合节点（Synthesis Agent）：
@@ -326,7 +371,7 @@ async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
       在航班 / 活动 API 挂掉时优雅降级，不编造数据。
     """
     print("━━━ NODE: Synthesis & Response ━━━")
-
+    customer_info = state.get("customer_info") or {}
     tool_results: Dict[str, str] = {}
     for msg in state["messages"]:
         if isinstance(msg, ToolMessage):
@@ -429,16 +474,20 @@ async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
     if (
         travel_plan
         and travel_plan.user_intent == "full_plan"
-        and travel_plan.total_budget
         and all_options["flights"]
         and all_options["hotels"]
     ):
-        print("→ Generating travel packages")
-        try:
-            packages = await generate_travel_packages(travel_plan, all_options)
-        except Exception as e:
-            print(f"✗ Package generation failed: {e}")
-            packages = []
+        budget_for_packages = _ensure_budget_for_packages(travel_plan, customer_info)
+        if budget_for_packages:
+            print(f"→ Generating travel packages (budget=${budget_for_packages})")
+            try:
+                packages = await generate_travel_packages(travel_plan, all_options)
+            except Exception as e:
+                print(f"✗ Package generation failed: {e}")
+                packages = []
+        else:
+            print("→ Skip package generation: no budget available")
+
 
     synthesis_prompt = ""
     hubspot_recommendations: Dict[str, Any] = {}
@@ -447,7 +496,14 @@ async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
     # 1) 有完整套餐
     # ------------------------------------------------------------------
     if packages:
-        print(f"→ Preparing response with {len(packages)} packages")
+        has_balanced = any(getattr(p, "grade", None) == "Balanced" for p in packages)
+
+        if has_balanced:
+            recommend_line = '- Highlight the "Balanced" package as recommended'
+        else:
+            # 没有 Balanced 时：推荐一个替代策略（例如推荐第一个/中位/最便宜）
+            recommend_line = f'- Recommend the "{packages[0].name}" package as the best choice'
+
         synthesis_prompt = f"""You are an AI travel assistant. You MUST respond in **English**.
 
 Present these custom travel packages professionally.
@@ -457,12 +513,10 @@ Present these custom travel packages professionally.
 **YOUR TASK:**
 - Start with a warm greeting
 - Present ALL packages with clear details (flight, hotel, activities)
-- Highlight the "Balanced" package as recommended
+{recommend_line}
 - End with clear call to action
 """
-        hubspot_recommendations = {
-            "packages": [p.model_dump() for p in packages],
-        }
+
 
     # ------------------------------------------------------------------
     # 2) 没有套餐，根据工具结果和错误信息降级
@@ -570,7 +624,7 @@ YOUR TASK:
                 ],
             }
         # 2.x 酒店 API 挂了，但有航班 / 活动结果
-        if hotel_error_message and (flights_exist or activities_exist):
+        elif hotel_error_message and (flights_exist or activities_exist):
             tool_results_for_prompt = {
                 "flights": [f.model_dump() for f in all_options.get("flights", [])],
                 "hotels": [],  # 没有真实酒店可展示
@@ -732,7 +786,7 @@ Offer specific ways to adjust:
         )
 
     # 邮件通知
-    customer_info = state.get("customer_info") or {}
+    # customer_info = state.get("customer_info") or {}
     to_email = customer_info.get("email")
 
     if to_email:
