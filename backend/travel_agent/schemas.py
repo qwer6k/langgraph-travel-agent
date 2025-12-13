@@ -23,6 +23,9 @@ class HotelOption(BaseModel):
     price_per_night: str = Field(description="Price per night")
     source: str = Field(description="Data source (e.g., 'Amadeus', 'Hotelbeds')")
     rating: Optional[float] = Field(description="Hotel rating", default=None)
+    # ✅ 新增：用于区分“接口挂了” vs “确实无库存”
+    is_error: bool = False
+    error_message: Optional[str] = None
 
 
 class ActivityOption(BaseModel):
@@ -97,3 +100,9 @@ class TravelAgentState(TypedDict):
     trip_details: Optional[Dict[str, Any]]
     original_request: Optional[str]
     is_continuation: Optional[bool]
+
+    # ✅ synthesize_results_node() 里会写入的字段，补进契约避免后续踩雷
+    flight_error_message: Optional[str]
+    activity_error_message: Optional[str]
+    hotel_error_message: Optional[str]
+

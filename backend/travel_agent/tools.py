@@ -45,6 +45,19 @@ def retry_async(retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
         return wrapper
     return deco
 
+def _hotel_error_placeholder(source: str, message: str) -> List[HotelOption]:
+    return [
+        HotelOption(
+            name="HOTEL_API_ERROR",
+            category="N/A",
+            price_per_night="N/A",
+            source=source,
+            rating=None,
+            is_error=True,
+            error_message=message,
+        )
+    ]
+
 
 def _safe_price_to_float(price: str) -> float | None:
     if not price:
@@ -198,19 +211,22 @@ JSON Output:
 """
     try:
         response = await llm.ainvoke(analysis_prompt)
-        content = response.content.strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
 
-        extracted_plan = TravelPlan.model_validate_json(content)
+        raw_content = getattr(response, "content", "")
+        if not isinstance(raw_content, str):
+            raw_content = str(raw_content)
+
+        # ✅ 允许模型输出前后夹带解释文字 / code fences：只抽取 {...}
+        json_str = _extract_json_object(raw_content)
+
+        extracted_plan = TravelPlan.model_validate_json(json_str)
         print(f"✓ Travel plan extracted: intent={extracted_plan.user_intent}")
         return extracted_plan
+
     except Exception as e:
         print(f"✗ Travel analysis failed: {e}")
         raise ValueError(f"Could not understand the travel request: {e}") from e
+
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +238,9 @@ class FlightSearchArgs(BaseModel):
     destinationLocationCode: str = Field(description="Arrival city IATA code")
     departureDate: str = Field(description="Departure date (YYYY-MM-DD)")
     returnDate: Optional[str] = Field(description="Return date (YYYY-MM-DD)")
-    adults: int = Field(description="Number of adult passengers", default=1)
-    currencyCode: str = Field(description="Preferred currency", default="USD")
+    adults: int = Field(default=1, description="Number of adult passengers")
+    currencyCode: str = Field(default="USD", description="Preferred currency")
+
 
 
 def _parse_and_prepare_offers(response_data: dict) -> List[Dict[str, Any]]:
@@ -279,6 +296,8 @@ def _find_closest_flight(offers: List[Dict[str, Any]], target_time_str: str) -> 
             return float("inf")
 
     return sorted(offers, key=get_time_difference)
+
+
 
 
 @tool(args_schema=FlightSearchArgs)
@@ -511,7 +530,11 @@ async def _search_hotelbeds_hotels(
     headers = hotelbeds_headers()
     if not headers:
         print("⚠ Hotelbeds API keys not configured")
-        return []
+        return _hotel_error_placeholder(
+            "Hotelbeds",
+            "Hotelbeds API keys not configured in environment.",
+        )
+
 
     api_url = "https://api.test.hotelbeds.com/hotel-api/1.0/hotels"
     check_in_date, check_out_date = await _clip_for_hotelbeds(
@@ -566,10 +589,14 @@ async def _search_hotelbeds_hotels(
             print("  Hotelbeds response body:", e.response.text)
         except Exception:
             pass
-        return []
+        return _hotel_error_placeholder(
+            "Hotelbeds",
+            f"Hotelbeds HTTP error {e.response.status_code}: {e.response.text if hasattr(e.response, 'text') else str(e)}",
+        )
     except Exception as e:
         print(f"✗ Hotelbeds error: {e}")
-        return []
+        return _hotel_error_placeholder("Hotelbeds", f"Hotelbeds error: {e!r}")
+
 
 
 async def _fallback_individual_hotel_search(
@@ -642,7 +669,11 @@ async def _search_amadeus_hotels(
 
     if not amadeus:
         print("⚠ Amadeus client not initialized")
-        return []
+        return _hotel_error_placeholder(
+            "Amadeus",
+            "Amadeus client not available in current environment.",
+        )
+
 
     try:
         loop = asyncio.get_running_loop()
@@ -718,10 +749,11 @@ async def _search_amadeus_hotels(
 
     except ResponseError as e:
         print(f"✗ Amadeus error: {e}")
-        return []
+        return _hotel_error_placeholder("Amadeus", f"Amadeus ResponseError: {e}")
     except Exception as e:
         print(f"✗ Unexpected error: {e}")
-        return []
+        return _hotel_error_placeholder("Amadeus", f"Amadeus hotel search error: {e!r}")
+
 
 
 @tool(args_schema=HotelSearchArgs)
@@ -788,11 +820,15 @@ async def search_activities_by_city(city_name: str) -> List[ActivityOption]:
     if lat == 0.0 and lng == 0.0:
         return [
             ActivityOption(
-                name="Error",
-                description=f"Could not determine coordinates for {city_name}",
+                name="COORDINATE_ERROR",
+                description="Could not determine city-center coordinates (required for activity search).",
                 price="N/A",
+                location=city_name,
+                is_error=True,
+                error_message=f"Could not determine coordinates for '{city_name}'",
             ),
         ]
+
 
     try:
         loop = asyncio.get_running_loop()

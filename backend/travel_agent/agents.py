@@ -86,6 +86,9 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
         # ==============================
         # Phase 1: 解析 TravelPlan
         # ==============================
+        import re
+        from typing import Optional
+
         print("→ Phase 1: Analyzing request")
         travel_plan = await enhanced_travel_analysis(user_request)
 
@@ -94,20 +97,40 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             travel_plan.origin = "Shanghai"
             print("→ Origin not provided, defaulting to Shanghai")
 
-        # 如果前端 form 已经填了 budget，就写回 TravelPlan
-        if customer_info.get("budget"):
+        def _parse_budget_to_float(raw: object) -> Optional[float]:
+            if raw is None:
+                return None
+            s = str(raw).strip()
+            if not s:
+                return None
+            s = s.upper().replace("USD", "").replace("$", "").replace(",", "").strip()
+            m = re.search(r"\d+(\.\d+)?", s)
+            if not m:
+                return None
             try:
-                budget_str = (
-                    customer_info["budget"]
-                    .upper()
-                    .replace("USD", "")
-                    .replace("$", "")
-                    .strip()
-                )
-                travel_plan.total_budget = float(budget_str)
-                print(f"→ Budget injected: ${travel_plan.total_budget}")
-            except (ValueError, TypeError):
-                print(f"⚠ Could not parse budget: {customer_info.get('budget')}")
+                return float(m.group(0))
+            except ValueError:
+                return None
+
+        # ✅ 只有 full_plan（需要生成套餐）才注入预算；flights_only/hotels_only/activities_only 不需要
+        if travel_plan.user_intent == "full_plan":
+            raw_budget = customer_info.get("budget")
+            fallback_budget = _parse_budget_to_float(raw_budget)
+
+            need_budget = (travel_plan.total_budget is None or travel_plan.total_budget <= 0)
+
+            # 仅在 TravelPlan 没预算时兜底写回
+            if need_budget and (fallback_budget is not None and fallback_budget > 0):
+                travel_plan.total_budget = fallback_budget
+                print(f"→ Budget injected (fallback): ${travel_plan.total_budget}")
+            else:
+                # 有 customer budget 但不覆盖（保留用户话里解析到的预算）
+                if raw_budget:
+                    print(f"→ Budget NOT injected (keep parsed): {travel_plan.total_budget}")
+        else:
+            # 可选：打个日志，方便排查为什么不注入
+            if customer_info.get("budget"):
+                print(f"→ Budget skip (intent={travel_plan.user_intent})")
 
         state["travel_plan"] = travel_plan
 
@@ -132,26 +155,58 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             departure_date = default_checkin
             return_date = default_checkout
 
+        
         # 航班工具
+        import re
+
+        def _is_one_way_request(text: str) -> bool:
+            t = (text or "").strip().lower()
+            # 你可以按需要继续加关键词（如“只看去程”“不返程”等）
+            patterns = [
+                r"单程",
+                r"one[-\s]?way",
+                r"\boneway\b",
+                r"只要去程",
+                r"只看去程",
+                r"不返程",
+            ]
+            return any(re.search(p, t, flags=re.IGNORECASE) for p in patterns)
+        
+
         if (
             travel_plan.user_intent in ["full_plan", "flights_only"]
             and travel_plan.origin
             and travel_plan.destination
         ):
-            task = search_flights.ainvoke(
-                {
-                    "originLocationCode": travel_plan.origin,
-                    "destinationLocationCode": travel_plan.destination,
-                    "departureDate": departure_date,
-                    "returnDate": return_date,
-                    "adults": travel_plan.adults,
-                    "currencyCode": "USD",
-                    "travelClass": travel_plan.travel_class,
-                    "departureTime": travel_plan.departure_time_pref,
-                    "arrivalTime": travel_plan.arrival_time_pref,
-                },
+            # ✅ 用当前用户输入判断单程（优先 original_request，其次最后一条 message）
+            latest_user_text = (
+                state.get("original_request")
+                or state["messages"][-1].content
+                or ""
             )
+            one_way = _is_one_way_request(latest_user_text)
+
+            flight_args = {
+                "originLocationCode": travel_plan.origin,
+                "destinationLocationCode": travel_plan.destination,
+                "departureDate": departure_date,
+                "adults": travel_plan.adults,
+                "currencyCode": "USD",
+                "travelClass": travel_plan.travel_class,
+                "departureTime": travel_plan.departure_time_pref,
+                "arrivalTime": travel_plan.arrival_time_pref,
+            }
+
+            # ✅ 仅在“非单程”且确实有 return_date 时才传 returnDate
+            if (not one_way) and return_date:
+                flight_args["returnDate"] = return_date
+            else:
+                # 可选：避免下游误判往返
+                travel_plan.return_date = None
+
+            task = search_flights.ainvoke(flight_args)
             tasks_and_names.append((task, "search_flights"))
+
 
         # 酒店工具
         if (
@@ -348,6 +403,26 @@ async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
         state["activity_error_message"] = activity_error_message
 
     # ------------------------------------------------------------------
+    # 额外处理：区分“正常酒店结果”和“酒店 API 错误占位”
+    # ------------------------------------------------------------------
+    hotels_all: List[HotelOption] = all_options.get("hotels", [])
+    normal_hotels: List[HotelOption] = []
+    hotel_error_message: Optional[str] = None
+
+    for h in hotels_all:
+        if getattr(h, "is_error", False):
+            if not hotel_error_message and getattr(h, "error_message", None):
+                hotel_error_message = h.error_message
+        else:
+            normal_hotels.append(h)
+
+    all_options["hotels"] = normal_hotels
+
+    if hotel_error_message:
+        state["hotel_error_message"] = hotel_error_message
+
+
+    # ------------------------------------------------------------------
     # 尝试生成套餐（仅在真实有机票 + 酒店时）
     # ------------------------------------------------------------------
     packages: List[TravelPackage] = []
@@ -493,6 +568,44 @@ YOUR TASK:
                     "Activity API temporarily unavailable",
                     activity_error_message,
                 ],
+            }
+        # 2.x 酒店 API 挂了，但有航班 / 活动结果
+        if hotel_error_message and (flights_exist or activities_exist):
+            tool_results_for_prompt = {
+                "flights": [f.model_dump() for f in all_options.get("flights", [])],
+                "hotels": [],  # 没有真实酒店可展示
+                "activities": [a.model_dump() for a in all_options.get("activities", [])],
+            }
+
+            destination = travel_plan.destination if travel_plan else ""
+
+            synthesis_prompt = f"""You are an AI travel assistant.You MUST respond in **English**.
+
+        IMPORTANT:
+        - The live **hotel availability search failed**, so you DO NOT have any concrete hotel options to show.
+        - You DO have real-time results for flights and/or activities.
+
+        Destination: {destination}
+
+        Technical note about the hotel error (summarize in simple terms if needed):
+        "{hotel_error_message}"
+
+        Using the structured data below:
+
+        {json.dumps(tool_results_for_prompt, indent=2)}
+
+        YOUR TASK:
+        - Clearly explain to the user that hotel search is temporarily unavailable.
+        - DO NOT invent or guess any specific hotel names, availability, or prices.
+        - Present the available flight and/or activity options in a clear, friendly way.
+        - Suggest concrete next steps for hotels (e.g. OTAs), or changing dates to retry.
+        - Keep the tone reassuring and practical.
+        """
+            hubspot_recommendations = {
+                "flights": tool_results_for_prompt["flights"],
+                "hotels": [],
+                "activities": tool_results_for_prompt["activities"],
+                "note": ["Hotel API temporarily unavailable", hotel_error_message],
             }
 
         # 2.3 有机票 & 活动，但没有酒店（你原来的逻辑，保留）
