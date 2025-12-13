@@ -88,38 +88,25 @@ async def run_agent_in_background(
     task_id: str,
     thread_id: str,
     message: str,
-    is_continuation: bool = False
+    is_continuation: bool = False,
 ):
     print(f"→ Background task {task_id} started (continuation: {is_continuation})")
 
     try:
-        # ============================================================
-        # 分离“对话 thread_id”和“graph checkpoint thread_id”
-        # - thread_id：用来存 customer_data（会话级别）
-        # - graph_thread_id：给 LangGraph 做 checkpoint 的 key（推理轮次级别）
-        #   - 续聊(is_continuation=True)：沿用 thread_id
-        #   - 新问题(is_continuation=False)：用 thread_id + task_id 组成一个新 key
-        # ============================================================
-        if is_continuation:
-            graph_thread_id = thread_id
-        else:
-            graph_thread_id = f"{thread_id}:{task_id}"
-
+        # ✅ checkpoint key 永远稳定：只用 thread_id
+        graph_thread_id = thread_id
         config = {"configurable": {"thread_id": graph_thread_id}}
 
-        # 初始 state：本轮用户消息 + 是否续聊
+        # ✅ 只传本轮用户消息 + is_continuation +（可选）customer_info
+        #    不要传 current_step，避免覆盖 checkpoint 内状态
         initial_state = {
             "messages": [HumanMessage(content=message)],
             "is_continuation": is_continuation,
         }
 
-        # 如果这个 thread_id 有客户信息，就注入到 state 里
         if thread_id in customer_data:
             initial_state["customer_info"] = customer_data[thread_id]
-            initial_state["current_step"] = "info_collected"
             print(f"→ Using stored customer info for thread {thread_id}")
-        else:
-            initial_state["current_step"] = "initial"
 
         # 调 LangGraph
         final_state = await agent_graph.ainvoke(initial_state, config)
@@ -127,27 +114,25 @@ async def run_agent_in_background(
         # ============================================================
         # 计算 reply
         # ============================================================
-        reply = None
-        msgs = final_state.get("messages", [])
+        reply: str | None = None
+        msgs = final_state.get("messages", []) or []
 
         # 是否已经有“非 HumanMessage”的回复（ToolMessage / AIMessage）
         has_non_human = any(not isinstance(m, HumanMessage) for m in msgs)
 
-        # ✅ 只有「当前这次调用的最终状态」还在 collecting_info，
-        #    且还没有任何机器人消息时，才给出“请先填写信息”的提示
+        # ✅ collecting_info 的提示：只依赖 final_state（更稳，不依赖 is_continuation）
         if (
-            (not is_continuation)
-            and final_state.get("form_to_display") == "customer_info"
+            final_state.get("form_to_display") == "customer_info"
             and final_state.get("current_step") == "collecting_info"
             and not has_non_human
         ):
             reply = (
                 "✅ I have noted your travel needs.\n\n"
-                "Please fill in your contact information below (name, email, budget, etc.),"
-                "I will immediately search for suitable flights, hotels, and activities based on this information."
+                "Please fill in your contact information below (name, email, budget, etc.). "
+                "After that, I will immediately search for suitable flights, hotels, and activities."
             )
         else:
-            # 其他情况：从最后往前找一条“非 HumanMessage”的消息作为回复
+            # 从最后往前找一条“非 HumanMessage”的消息作为回复
             for msg in reversed(msgs):
                 if isinstance(msg, HumanMessage):
                     continue
@@ -156,7 +141,6 @@ async def run_agent_in_background(
                     reply = str(content)
                     break
 
-        # 兜底：实在没找到就给一个默认提示
         if reply is None:
             reply = "I've processed the information."
 
@@ -165,7 +149,7 @@ async def run_agent_in_background(
             "result": {"reply": reply},
         }
 
-        # form_to_display 仍然照旧返回，前端会用它决定是否弹窗
+        # 仍然把 form_to_display 返回给前端，维持交互逻辑
         if final_state.get("form_to_display"):
             result_data["form_to_display"] = final_state["form_to_display"]
 
@@ -174,12 +158,14 @@ async def run_agent_in_background(
 
     except Exception as e:
         import traceback
+
         traceback.print_exc()
         jobs[task_id] = {
             "status": "failed",
             "result": {"error": str(e)},
         }
         print(f"✗ Background task {task_id} failed: {e}")
+
 
 # ============================================================================
 # API ENDPOINTS
@@ -264,15 +250,17 @@ async def submit_customer_info(request: CustomerInfoRequest):
 async def clear_thread(thread_id: str):
     """
     Clear stored data for a conversation thread.
-    
-    Removes customer info and allows starting fresh.
+    同时重建 agent_graph，把 InMemorySaver 里的所有 checkpoint 一起清掉。
     """
-    if thread_id in customer_data:
-        del customer_data[thread_id]
-        print(f"→ Thread {thread_id} cleared")
-        return {"status": "cleared"}
-    else:
-        raise HTTPException(status_code=404, detail="Thread not found")
+    # 1. 清业务数据
+    customer_data.pop(thread_id, None)
+
+    # 2. 重建图 = 清掉所有 thread 的 checkpoint（单用户最粗暴有效）
+    global agent_graph
+    agent_graph = build_enhanced_graph()
+
+    print(f"→ Thread {thread_id} customer data cleared & graph rebuilt (all checkpoints dropped)")
+    return {"status": "cleared"}
 
 # ============================================================================
 # STARTUP/SHUTDOWN EVENTS

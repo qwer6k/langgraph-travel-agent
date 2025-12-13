@@ -227,6 +227,33 @@ JSON Output:
         print(f"✗ Travel analysis failed: {e}")
         raise ValueError(f"Could not understand the travel request: {e}") from e
 
+# ---------------------------------------------------------------------------
+# Travel plan update based on user feedback
+# ---------------------------------------------------------------------------
+async def update_travel_plan(prev: TravelPlan, user_update: str) -> TravelPlan:
+    prompt = f"""
+You are updating an existing travel plan based on a user's new message.
+
+PREVIOUS PLAN (JSON):
+{json.dumps(prev.model_dump(), ensure_ascii=False)}
+
+USER UPDATE:
+"{user_update}"
+
+RULES:
+- Keep any fields not mentioned by the user unchanged.
+- Only modify fields the user explicitly changes.
+- Output MUST be valid JSON matching this schema:
+{TravelPlan.model_json_schema()}
+
+JSON Output:
+"""
+    resp = await llm.ainvoke(prompt)
+    raw = getattr(resp, "content", "")
+    json_str = _extract_json_object(raw)
+    return TravelPlan.model_validate_json(json_str)
+
+
 
 
 # ---------------------------------------------------------------------------
