@@ -23,6 +23,40 @@ from .tools import (
     send_to_hubspot,
     send_email_notification,
 )
+import hashlib
+
+def _compute_tool_key(tool_name: str, travel_plan: TravelPlan, **kwargs) -> str:
+    """
+    为工具调用生成唯一指纹 key（由该工具依赖的 plan 字段值拼接后 hash）
+    """
+    parts = []
+    if tool_name == "search_flights":
+        parts.extend([
+            kwargs.get("originLocationCode") or travel_plan.origin or "",
+            kwargs.get("destinationLocationCode") or travel_plan.destination or "",
+            kwargs.get("departureDate") or travel_plan.departure_date or "",
+            kwargs.get("returnDate") or travel_plan.return_date or "",
+            str(kwargs.get("adults") or travel_plan.adults),
+            kwargs.get("travelClass") or travel_plan.travel_class or "",
+            kwargs.get("departureTime") or travel_plan.departure_time_pref or "",
+            kwargs.get("arrivalTime") or travel_plan.arrival_time_pref or "",
+            "one_way" if kwargs.get("one_way") else "round_trip",
+        ])
+    elif tool_name == "search_and_compare_hotels":
+        parts.extend([
+            kwargs.get("city_code") or travel_plan.destination or "",
+            kwargs.get("check_in_date") or travel_plan.departure_date or "",
+            kwargs.get("check_out_date") or travel_plan.return_date or "",
+            str(travel_plan.adults)
+        ])
+    elif tool_name == "search_activities_by_city":
+        parts.extend([
+            kwargs.get("city_name") or travel_plan.destination or ""
+        ])
+    
+    # 拼接并取 md5 前 8 位（足够短且唯一）
+    key_str = "|".join(str(p) for p in parts)
+    return hashlib.md5(key_str.encode()).hexdigest()[:8]
 
 
 def _calculate_default_dates(travel_plan: TravelPlan) -> tuple[str, str]:
@@ -74,10 +108,10 @@ def _compute_rerun_flags(prev: Optional[TravelPlan], new: TravelPlan) -> tuple[b
 
     flights_deps = {
         "origin", "destination", "departure_date", "return_date",
-        "adults", "travel_class", "departure_time_pref", "arrival_time_pref",
+        "adults", "travel_class", "departure_time_pref", "arrival_time_pref","user_intent", 
     }
-    hotels_deps = {"destination", "departure_date", "return_date", "adults"}
-    activities_deps = {"destination"}
+    hotels_deps = {"destination", "departure_date", "return_date", "adults","user_intent", }
+    activities_deps = {"destination", "user_intent", }
 
     rerun_flights = bool(changed & flights_deps)
     rerun_hotels = bool(changed & hotels_deps)
@@ -95,6 +129,7 @@ def _is_one_way_request(text: str) -> bool:
     t = (text or "").strip().lower()
     patterns = [
         r"单程",
+        r"单向",
         r"one[-\s]?way",
         r"\boneway\b",
         r"只要去程",
@@ -118,7 +153,6 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
     """
     print("━━━ NODE: Analysis & Execution ━━━")
 
-    # 兼容保留（前端可能传，也可能不传）
     _ = state.get("is_continuation", False)
 
     # ------------------------------------------------------------------
@@ -138,6 +172,9 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
         }
 
     customer_info = state.get("customer_info", {}) or {}
+
+    # ✅ 默认值要在 try 外初始化，保证 except 里也能用
+    one_way = state.get("one_way", False)
 
     try:
         # ==============================
@@ -162,17 +199,13 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
         if customer_info.get("budget"):
             print(f"→ Budget captured (not injected in analysis): {customer_info.get('budget')}")
 
-        # diff gating（在写回 state 之前用 prev_plan）
         rerun_flights, rerun_hotels, rerun_activities = _compute_rerun_flags(prev_plan, travel_plan)
         print(f"→ Rerun flags: flights={rerun_flights}, hotels={rerun_hotels}, activities={rerun_activities}")
 
-        # 写回
+        # 写回 plan
         state["travel_plan"] = travel_plan
 
-        # ------------------------------------------------------------------
-        # ✅ 给 synthesize 用：按 intent 决定“本轮应当读取/复用”的工具范围
-        #    注意：这是“范围”，不是“本轮实际执行的工具集合”
-        # ------------------------------------------------------------------
+        # synthesize 用：本轮应该读取/复用的工具范围（不是本轮实际执行集合）
         intent = travel_plan.user_intent if travel_plan else "full_plan"
         reuse_tools = {
             "flights_only": ["search_flights"],
@@ -186,7 +219,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
         # ==============================
         print(f"→ Phase 2: Preparing tools (intent: {travel_plan.user_intent})")
 
-        tasks_and_names: List[tuple[Awaitable, str]] = []
+        tasks_and_names: List[tuple[Awaitable, str, Dict[str, Any]]] = []
 
         default_checkin, default_checkout = _calculate_default_dates(travel_plan)
         departure_date = travel_plan.departure_date or default_checkin
@@ -202,68 +235,113 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             departure_date = default_checkin
             return_date = default_checkout
 
+        # ✅ 写回：保证 synthesize/本轮一致
+        travel_plan.departure_date = departure_date
+        travel_plan.return_date = return_date
+
+        # ----------------------------------------------------------
+        # 0. one-way：你要求永远按往返处理（保持你当前逻辑）
+        # ----------------------------------------------------------
+        one_way = False
+        state["one_way"] = False
+
+        # ✅ 关键：语义原始地点（给 key 用），不要被 IATA 覆写污染 plan
+        raw_origin = travel_plan.origin
+        raw_dest = travel_plan.destination
+
+        # ✅ 关键：本轮“用于 key 的参数”（语义版本）
+        # （即使 last_tool_args 在 state 合并时丢了也没关系，因为 tool_call_id 也用语义 key）
+        key_args_update: Dict[str, Dict[str, Any]] = {}
+
         # ---- flights ----
         if (
             rerun_flights
             and travel_plan.user_intent in ["full_plan", "flights_only"]
-            and travel_plan.origin
-            and travel_plan.destination
+            and raw_origin
+            and raw_dest
         ):
-            latest_user_text = (
-                state["messages"][-1].content
-                or state.get("original_request")
-                or ""
-            )
-            one_way = _is_one_way_request(latest_user_text)
+            from .location_utils import location_to_airport_code
+            from .config import amadeus as amadeus_client
 
+            origin_iata = await location_to_airport_code(amadeus_client, raw_origin)
+            dest_iata = await location_to_airport_code(amadeus_client, raw_dest)
+
+            # 实际调用工具参数（IATA）
             flight_args = {
-                "originLocationCode": travel_plan.origin,
-                "destinationLocationCode": travel_plan.destination,
+                "originLocationCode": origin_iata,
+                "destinationLocationCode": dest_iata,
                 "departureDate": departure_date,
+                "returnDate": return_date,  # ✅ 永远往返
                 "adults": travel_plan.adults,
                 "currencyCode": "USD",
                 "travelClass": travel_plan.travel_class,
                 "departureTime": travel_plan.departure_time_pref,
                 "arrivalTime": travel_plan.arrival_time_pref,
             }
+            tasks_and_names.append((search_flights.ainvoke(flight_args), "search_flights", flight_args))
 
-            if (not one_way) and return_date:
-                flight_args["returnDate"] = return_date
-            else:
-                travel_plan.return_date = None
-
-            tasks_and_names.append((search_flights.ainvoke(flight_args), "search_flights"))
+            # ✅ 用于 key 的参数（语义，不用 IATA）
+            key_args_update["search_flights"] = {
+                "originLocationCode": raw_origin,
+                "destinationLocationCode": raw_dest,
+                "departureDate": departure_date,
+                "returnDate": return_date,
+                "adults": travel_plan.adults,
+                "travelClass": travel_plan.travel_class,
+                "departureTime": travel_plan.departure_time_pref,
+                "arrivalTime": travel_plan.arrival_time_pref,
+                "one_way": one_way,
+            }
 
         # ---- hotels ----
         if (
             rerun_hotels
             and travel_plan.user_intent in ["full_plan", "hotels_only"]
-            and travel_plan.destination
+            and raw_dest
         ):
+            from .location_utils import flexible_city_code
+            from .config import amadeus as amadeus_client
+
+            city_code = await flexible_city_code(amadeus_client, raw_dest)
+
             hotel_args = {
-                "city_code": travel_plan.destination,
+                "city_code": city_code,  # 实际调用用 city code
                 "check_in_date": departure_date,
                 "check_out_date": return_date,
                 "adults": travel_plan.adults,
             }
-            tasks_and_names.append((search_and_compare_hotels.ainvoke(hotel_args), "search_and_compare_hotels"))
+            tasks_and_names.append((search_and_compare_hotels.ainvoke(hotel_args), "search_and_compare_hotels", hotel_args))
+
+            # ✅ 用于 key 的参数（语义）
+            key_args_update["search_and_compare_hotels"] = {
+                "city_code": raw_dest,
+                "check_in_date": departure_date,
+                "check_out_date": return_date,
+                "adults": travel_plan.adults,
+            }
 
         # ---- activities ----
         if (
             rerun_activities
             and travel_plan.user_intent in ["full_plan", "activities_only"]
-            and travel_plan.destination
+            and raw_dest
         ):
-            tasks_and_names.append(
-                (search_activities_by_city.ainvoke({"city_name": travel_plan.destination}), "search_activities_by_city")
-            )
+            act_args = {"city_name": raw_dest}
+            tasks_and_names.append((search_activities_by_city.ainvoke(act_args), "search_activities_by_city", act_args))
+
+            # ✅ 用于 key 的参数（语义）
+            key_args_update["search_activities_by_city"] = {"city_name": raw_dest}
+
+        # ✅ 合并并写回 last_tool_args（注意：这里存的是“key 用语义参数”）
+        prev_last_args = state.get("last_tool_args") or {}
+        merged_last_args = dict(prev_last_args)
+        merged_last_args.update(key_args_update)
+        state["last_tool_args"] = merged_last_args
 
         # ==============================
-        # Phase 2.5: 工具复用入口（关键）
+        # Phase 2.5: 工具复用入口
         # ==============================
-        has_any_tool_history = any(
-            isinstance(m, ToolMessage) for m in state.get("messages", [])
-        )
+        has_any_tool_history = any(isinstance(m, ToolMessage) for m in state.get("messages", []))
 
         if not tasks_and_names:
             if has_any_tool_history:
@@ -273,7 +351,9 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
                     "current_step": "synthesizing",
                     "travel_plan": travel_plan,
                     "form_to_display": None,
-                    "tools_used": reuse_tools,  # ✅ 按 intent 给全范围
+                    "tools_used": reuse_tools,
+                    "one_way": one_way,
+                    "last_tool_args": state.get("last_tool_args") or {},
                 }
 
             print("⚠ No tools to call and no previous tool history")
@@ -289,6 +369,8 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
                 "current_step": "complete",
                 "travel_plan": travel_plan,
                 "form_to_display": None,
+                "one_way": one_way,
+                "last_tool_args": state.get("last_tool_args") or {},
             }
 
         # ==============================
@@ -336,8 +418,16 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
 
             return json.dumps(payload, ensure_ascii=False)
 
-        for i, (task_coro, tool_name) in enumerate(tasks_and_names):
+        for i, (task_coro, tool_name, tool_args) in enumerate(tasks_and_names):
             print(f"→ [{i+1}/{len(tasks_and_names)}] Running tool: {tool_name}")
+
+            # ✅ 关键：tool_call_id 的 key 必须用“语义 key”，保证 synthesize 即使拿不到 last_tool_args 也能对齐
+            key_kwargs = dict((state.get("last_tool_args") or {}).get(tool_name, {}) or {})
+            if tool_name == "search_flights":
+                key_kwargs["one_way"] = one_way  # 保持 key 一致
+
+            current_tool_key = _compute_tool_key(tool_name, travel_plan, **key_kwargs)
+
             try:
                 result = await task_coro
                 try:
@@ -345,7 +435,6 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
                 except Exception as e:
                     print(f"✗ Serialization failed for {tool_name}: {e}")
                     content = _tool_error_placeholder(tool_name, e)
-
             except Exception as e:
                 print(f"✗ Tool {tool_name} failed: {e}")
                 content = _tool_error_placeholder(tool_name, e)
@@ -354,7 +443,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
                 ToolMessage(
                     content=content,
                     name=tool_name,
-                    tool_call_id=f"call_{tool_name}_{i}",
+                    tool_call_id=f"call_{tool_name}:{current_tool_key}:{i}",
                 )
             )
 
@@ -363,36 +452,36 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
 
         print("✓ All tools executed")
 
-        # ✅ tools_used 不用“本轮跑了哪些”，而是“本轮 synthesize 应读取的范围”
-        tools_used = reuse_tools
-
         return {
             "messages": processed_messages,
             "current_step": "synthesizing",
             "travel_plan": travel_plan,
             "form_to_display": None,
-            "tools_used": tools_used,
+            "tools_used": reuse_tools,
+            "one_way": one_way,
+            "last_tool_args": state.get("last_tool_args") or {},
         }
 
     except ValueError as e:
         print(f"✗ Analysis failed: {e}")
         return {
-            "messages": [
-                AIMessage(content="I'm sorry, I had trouble understanding your request. Could you rephrase it?")
-            ],
+            "messages": [AIMessage(content="I'm sorry, I had trouble understanding your request. Could you rephrase it?")],
             "current_step": "complete",
             "form_to_display": None,
+            "one_way": one_way,
+            "last_tool_args": state.get("last_tool_args") or {},
         }
 
     except Exception as e:
         print(f"✗ Unexpected error: {e}")
         return {
-            "messages": [
-                AIMessage(content="I apologize, but a system error occurred. Please try again.")
-            ],
+            "messages": [AIMessage(content="I apologize, but a system error occurred. Please try again.")],
             "current_step": "complete",
             "form_to_display": None,
+            "one_way": one_way,
+            "last_tool_args": state.get("last_tool_args") or {},
         }
+
 
 
 
@@ -428,7 +517,7 @@ def _ensure_budget_for_packages(travel_plan: TravelPlan, customer_info: dict) ->
 
     return None
 
-async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]: 
+async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
     """
     综合节点（Synthesis Agent）：
     1. 把工具 ToolMessage 的 JSON 解析成 Flight/Hotel/Activity 对象
@@ -437,122 +526,215 @@ async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
     4. 把结果同步到 CRM + 给用户发邮件
 
     额外处理：
-    - 识别 FlightOption / ActivityOption 中的 is_error / error_message，
-      在航班 / 活动 API 挂掉时优雅降级，不编造数据。
+    - 识别 FlightOption / ActivityOption / HotelOption 中的 is_error / error_message，
+      在 API 挂掉时优雅降级，不编造数据。
     """
     print("━━━ NODE: Synthesis & Response ━━━")
+
     travel_plan = state.get("travel_plan")
-    ##新增:synthesize 只读「本轮该读」的工具
+    customer_info = state.get("customer_info") or {}
+
+    # ------------------------------------------------------------------
+    # 1) 白名单过滤（保持你原有逻辑）
+    # ------------------------------------------------------------------
     tools_used = state.get("tools_used", [])
     if tools_used:
         allowed_tools = set(tools_used)
-    else:                       # 兜底用 intent
+    else:
         intent = travel_plan.user_intent if travel_plan else "full_plan"
         allowed_tools = {
-                "flights_only": {"search_flights"},
-                "hotels_only": {"search_and_compare_hotels"},
-                "activities_only": {"search_activities_by_city"},
-                "full_plan": {"search_flights", "search_and_compare_hotels", "search_activities_by_city"},
-            }.get(intent, set())
+            "flights_only": {"search_flights"},
+            "hotels_only": {"search_and_compare_hotels"},
+            "activities_only": {"search_activities_by_city"},
+            "full_plan": {"search_flights", "search_and_compare_hotels", "search_activities_by_city"},
+        }.get(intent, set())
 
+    # ------------------------------------------------------------------
+    # 2) 为当前“本轮参数”计算每个工具的 key（用于精确匹配）
+    #    ✅ 关键改动：优先用 state["last_tool_args"] 来算 key
+    #       这样不会被 “语义城市名 vs IATA/城市码” 的差异搞崩
+    # ------------------------------------------------------------------
+    current_keys: Dict[str, str] = {}
+    one_way = state.get("one_way", False)
+    last_args_all: Dict[str, Dict[str, Any]] = state.get("last_tool_args") or {}
+
+    if travel_plan:
+        # flights
+        flight_args = dict(last_args_all.get("search_flights") or {})
+        # ✅ one_way 作为 key 的一部分，保证一致
+        flight_args["one_way"] = one_way
+        current_keys["search_flights"] = _compute_tool_key("search_flights", travel_plan, **flight_args)
+
+        # hotels
+        hotel_args = dict(last_args_all.get("search_and_compare_hotels") or {})
+        current_keys["search_and_compare_hotels"] = _compute_tool_key("search_and_compare_hotels", travel_plan, **hotel_args)
+
+        # activities
+        act_args = dict(last_args_all.get("search_activities_by_city") or {})
+        current_keys["search_activities_by_city"] = _compute_tool_key("search_activities_by_city", travel_plan, **act_args)
+
+    # ------------------------------------------------------------------
+    # 3) 倒序扫描 ToolMessage，但只取 tool_key 匹配的那条（每个工具各取一条）
+    #    ✅ tool_call_id 解析更健壮：兼容 split 后段数不等 / None
+    # ------------------------------------------------------------------
     tool_results: Dict[str, str] = {}
-    for msg in state.get("messages", []):
-        if isinstance(msg, ToolMessage) and msg.name in allowed_tools:
-            try:
+    pending = set(allowed_tools)
+
+    for msg in reversed(state.get("messages", [])):
+        if not pending:
+            break
+
+        if isinstance(msg, ToolMessage) and msg.name in pending:
+            tool_call_id = getattr(msg, "tool_call_id", None) or ""
+            parts = tool_call_id.split(":")
+
+            # 期望格式："call_<tool>:<key>:<index>"
+            # ✅ 宽松处理：只要 >=3 段，就取 parts[1] 当 key
+            if len(parts) >= 3:
+                stored_key = parts[1]
+            else:
+                # 旧格式 / 异常格式：跳过（也可以在这里做更激进的 fallback）
+                continue
+
+            if stored_key == current_keys.get(msg.name):
                 tool_results[msg.name] = msg.content
+                pending.remove(msg.name)
+
+    print("🔍 allowed_tools:", allowed_tools)
+    print("🔍 last_tool_args keys:", list(last_args_all.keys()))
+    print("🔍 current_keys:", current_keys)
+    print("📦 stored_keys  :", [
+        getattr(m, "tool_call_id", None) for m in state.get("messages", [])
+        if isinstance(m, ToolMessage)
+    ])
+    # print("✅ 匹配到结果   :", list(tool_results.keys()))
+    # print("🧪 pending 剩余 :", pending)
+
+    # ------------------------------------------------------------------
+    # 3.1) 如果 key 匹配不到任何 ToolMessage，也视为“工具失败”
+    # ------------------------------------------------------------------
+    if not tool_results and allowed_tools:
+        flight_error_message = "Travel supplier APIs temporarily unavailable"
+        synthesis_prompt = f"""You are an AI travel assistant. You MUST respond in **English**.
+
+IMPORTANT:
+- The live **travel search system is temporarily unavailable**, so no concrete flight/hotel/activity options could be retrieved.
+- This is a technical issue, not a lack of inventory.
+
+YOUR TASK:
+- Clearly explain that the search system is experiencing a temporary outage.
+- DO NOT invent or guess any schedules, prices, or availability.
+- Suggest the user try again in a few minutes, or book components separately on common OTAs.
+- Keep the tone reassuring and practical.
+"""
+        hubspot_recommendations = {
+            "error": "Supplier API failure",
+            "details": {"message": flight_error_message},
+        }
+
+        try:
+            final_response = await llm.ainvoke(synthesis_prompt)
+        except Exception as e:
+            print(f"✗ Response generation failed: {e}")
+            final_response = AIMessage(
+                content="I apologize, but I encountered an issue generating your recommendations. Please try again."
+            )
+
+        # 邮件通知（抄你原有代码）
+        to_email = customer_info.get("email")
+        if to_email:
+            try:
+                await send_email_notification.ainvoke({
+                    "to_email": to_email,
+                    "subject": "Your AI travel plan",
+                    "body": final_response.content,
+                })
+                print(f"✓ Email sent to customer email: {to_email}")
             except Exception as e:
-                print(f"⚠ Failed to process {msg.name}: {e}")
-                tool_results[msg.name] = "[]"
+                print(f"✗ Failed to send email to customer: {e}")
+        else:
+            print("⚠ No email found in customer_info, skip email notification.")
 
-    customer_info = state.get("customer_info") or {}
-    
+        return {
+            "messages": [final_response],
+            "current_step": "complete",
+            "form_to_display": None,
+        }
 
-    # 解析工具返回为结构化 options
+    # ------------------------------------------------------------------
+    # 4) 解析工具返回为结构化 options
+    # ------------------------------------------------------------------
     all_options: Dict[str, list] = {"flights": [], "hotels": [], "activities": []}
+
+    # 按当前 intent 过滤，空类别直接置空，前端不再显示“No xxx”
+    intent = travel_plan.user_intent if travel_plan else "full_plan"
+    if intent == "flights_only":
+        all_options["hotels"] = []
+        all_options["activities"] = []
+    elif intent == "hotels_only":
+        all_options["flights"] = []
+        all_options["activities"] = []
+    elif intent == "activities_only":
+        all_options["flights"] = []
+        all_options["hotels"] = []
+
     for tool_name, content in tool_results.items():
         try:
             if content and content != "[]":
                 parsed_data = json.loads(content)
                 if tool_name == "search_flights":
-                    all_options["flights"] = [
-                        FlightOption.model_validate(f) for f in parsed_data
-                    ]
+                    all_options["flights"] = [FlightOption.model_validate(f) for f in parsed_data]
                 elif tool_name == "search_and_compare_hotels":
-                    all_options["hotels"] = [
-                        HotelOption.model_validate(h) for h in parsed_data
-                    ]
+                    all_options["hotels"] = [HotelOption.model_validate(h) for h in parsed_data]
                 elif tool_name == "search_activities_by_city":
-                    all_options["activities"] = [
-                        ActivityOption.model_validate(a) for a in parsed_data
-                    ]
+                    all_options["activities"] = [ActivityOption.model_validate(a) for a in parsed_data]
         except (json.JSONDecodeError, TypeError, ValueError) as e:
             print(f"✗ Failed to parse {tool_name}: {e}")
 
     # ------------------------------------------------------------------
-    # 额外处理：区分“正常航班结果”和“航班 API 错误占位”
+    # 5) 错误占位过滤：flights / activities / hotels
     # ------------------------------------------------------------------
     flights_all: List[FlightOption] = all_options.get("flights", [])
     normal_flights: List[FlightOption] = []
     flight_error_message: Optional[str] = None
-
     for f in flights_all:
-        # 兼容：没有 is_error 字段时，默认 False
         if getattr(f, "is_error", False):
             if not flight_error_message and getattr(f, "error_message", None):
                 flight_error_message = f.error_message
         else:
             normal_flights.append(f)
-
-    # 用处理后的“正常航班”覆盖回去
     all_options["flights"] = normal_flights
-
-    # 你也可以把错误信息挂回 state，方便以后调试
     if flight_error_message:
         state["flight_error_message"] = flight_error_message
 
-    # ------------------------------------------------------------------
-    # 额外处理：区分“正常活动结果”和“活动 API 错误占位”
-    # ------------------------------------------------------------------
     activities_all: List[ActivityOption] = all_options.get("activities", [])
     normal_activities: List[ActivityOption] = []
     activity_error_message: Optional[str] = None
-
     for a in activities_all:
-        # 同样兼容：没有 is_error 字段时，默认 False
         if getattr(a, "is_error", False):
             if not activity_error_message and getattr(a, "error_message", None):
                 activity_error_message = a.error_message
         else:
             normal_activities.append(a)
-
-    # 覆盖回“正常活动”
     all_options["activities"] = normal_activities
-
     if activity_error_message:
         state["activity_error_message"] = activity_error_message
 
-    # ------------------------------------------------------------------
-    # 额外处理：区分“正常酒店结果”和“酒店 API 错误占位”
-    # ------------------------------------------------------------------
     hotels_all: List[HotelOption] = all_options.get("hotels", [])
     normal_hotels: List[HotelOption] = []
     hotel_error_message: Optional[str] = None
-
     for h in hotels_all:
         if getattr(h, "is_error", False):
             if not hotel_error_message and getattr(h, "error_message", None):
                 hotel_error_message = h.error_message
         else:
             normal_hotels.append(h)
-
     all_options["hotels"] = normal_hotels
-
     if hotel_error_message:
         state["hotel_error_message"] = hotel_error_message
 
-
     # ------------------------------------------------------------------
-    # 尝试生成套餐（仅在真实有机票 + 酒店时）
+    # 6) 尝试生成套餐（仅在真实有机票 + 酒店时）
     # ------------------------------------------------------------------
     packages: List[TravelPackage] = []
     if (
@@ -572,20 +754,17 @@ async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
         else:
             print("→ Skip package generation: no budget available")
 
-
     synthesis_prompt = ""
     hubspot_recommendations: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
-    # 1) 有完整套餐
+    # 7) 生成最终话术（保留你原来的分支逻辑，下面不改）
     # ------------------------------------------------------------------
     if packages:
         has_balanced = any(getattr(p, "grade", None) == "Balanced" for p in packages)
-
         if has_balanced:
             recommend_line = '- Highlight the "Balanced" package as recommended'
         else:
-            # 没有 Balanced 时：推荐一个替代策略（例如推荐第一个/中位/最便宜）
             recommend_line = f'- Recommend the "{packages[0].name}" package as the best choice'
 
         synthesis_prompt = f"""You are an AI travel assistant. You MUST respond in **English**.
@@ -600,36 +779,24 @@ Present these custom travel packages professionally.
 {recommend_line}
 - End with clear call to action
 """
-
-
-    # ------------------------------------------------------------------
-    # 2) 没有套餐，根据工具结果和错误信息降级
-    # ------------------------------------------------------------------
     else:
         flights_exist = bool(all_options["flights"])
         hotels_exist = bool(all_options["hotels"])
         activities_exist = bool(all_options["activities"])
         has_any_results = flights_exist or hotels_exist or activities_exist
 
-        # 2.1 航班 API 挂了，但酒店 / 活动有结果
         if flight_error_message and (hotels_exist or activities_exist):
             tool_results_for_prompt = {
-                "flights": [],  # 没有真实航班数据可展示
+                "flights": [],
                 "hotels": [h.model_dump() for h in all_options.get("hotels", [])],
-                "activities": [
-                    a.model_dump() for a in all_options.get("activities", [])
-                ],
+                "activities": [a.model_dump() for a in all_options.get("activities", [])],
             }
-
             destination = travel_plan.destination if travel_plan else ""
-
-            # 如果活动也挂了，就一起在技术说明里提一下
             activity_error_note = (
                 f'\nActivity search also failed with internal error:\n"{activity_error_message}"'
                 if activity_error_message
                 else ""
             )
-
             synthesis_prompt = f"""You are an AI travel assistant.You MUST respond in **English**.
 
 IMPORTANT:
@@ -658,23 +825,16 @@ YOUR TASK:
                 "flights": [],
                 "hotels": tool_results_for_prompt["hotels"],
                 "activities": tool_results_for_prompt["activities"],
-                "note": [
-                    "Flight API temporarily unavailable",
-                    flight_error_message,
-                    activity_error_message,
-                ],
+                "note": ["Flight API temporarily unavailable", flight_error_message, activity_error_message],
             }
 
-        # 2.2 活动 API 挂了，但有航班 / 酒店结果
         elif activity_error_message and (flights_exist or hotels_exist):
             tool_results_for_prompt = {
                 "flights": [f.model_dump() for f in all_options.get("flights", [])],
                 "hotels": [h.model_dump() for h in all_options.get("hotels", [])],
-                "activities": [],  # 没有真实活动可展示
+                "activities": [],
             }
-
             destination = travel_plan.destination if travel_plan else ""
-
             synthesis_prompt = f"""You are an AI travel assistant.You MUST respond in **English**.
 
 IMPORTANT:
@@ -702,43 +862,38 @@ YOUR TASK:
                 "flights": tool_results_for_prompt["flights"],
                 "hotels": tool_results_for_prompt["hotels"],
                 "activities": [],
-                "note": [
-                    "Activity API temporarily unavailable",
-                    activity_error_message,
-                ],
+                "note": ["Activity API temporarily unavailable", activity_error_message],
             }
-        # 2.x 酒店 API 挂了，但有航班 / 活动结果
+
         elif hotel_error_message and (flights_exist or activities_exist):
             tool_results_for_prompt = {
                 "flights": [f.model_dump() for f in all_options.get("flights", [])],
-                "hotels": [],  # 没有真实酒店可展示
+                "hotels": [],
                 "activities": [a.model_dump() for a in all_options.get("activities", [])],
             }
-
             destination = travel_plan.destination if travel_plan else ""
-
             synthesis_prompt = f"""You are an AI travel assistant.You MUST respond in **English**.
 
-        IMPORTANT:
-        - The live **hotel availability search failed**, so you DO NOT have any concrete hotel options to show.
-        - You DO have real-time results for flights and/or activities.
+IMPORTANT:
+- The live **hotel availability search failed**, so you DO NOT have any concrete hotel options to show.
+- You DO have real-time results for flights and/or activities.
 
-        Destination: {destination}
+Destination: {destination}
 
-        Technical note about the hotel error (summarize in simple terms if needed):
-        "{hotel_error_message}"
+Technical note about the hotel error (summarize in simple terms if needed):
+"{hotel_error_message}"
 
-        Using the structured data below:
+Using the structured data below:
 
-        {json.dumps(tool_results_for_prompt, indent=2)}
+{json.dumps(tool_results_for_prompt, indent=2)}
 
-        YOUR TASK:
-        - Clearly explain to the user that hotel search is temporarily unavailable.
-        - DO NOT invent or guess any specific hotel names, availability, or prices.
-        - Present the available flight and/or activity options in a clear, friendly way.
-        - Suggest concrete next steps for hotels (e.g. OTAs), or changing dates to retry.
-        - Keep the tone reassuring and practical.
-        """
+YOUR TASK:
+- Clearly explain to the user that hotel search is temporarily unavailable.
+- DO NOT invent or guess any specific hotel names, availability, or prices.
+- Present the available flight and/or activity options in a clear, friendly way.
+- Suggest concrete next steps for hotels (e.g. OTAs), or changing dates to retry.
+- Keep the tone reassuring and practical.
+"""
             hubspot_recommendations = {
                 "flights": tool_results_for_prompt["flights"],
                 "hotels": [],
@@ -746,17 +901,12 @@ YOUR TASK:
                 "note": ["Hotel API temporarily unavailable", hotel_error_message],
             }
 
-        # 2.3 有机票 & 活动，但没有酒店（你原来的逻辑，保留）
         elif flights_exist and not hotels_exist:
             tool_results_for_prompt = {
                 "flights": [f.model_dump() for f in all_options.get("flights", [])],
-                "activities": [
-                    a.model_dump() for a in all_options.get("activities", [])
-                ],
+                "activities": [a.model_dump() for a in all_options.get("activities", [])],
             }
-
             destination = travel_plan.destination if travel_plan else ""
-
             synthesis_prompt = f"""You are an AI travel assistant.You MUST respond in **English**.
 
 We successfully found **flight options and activities**, but **no real-time hotel availability** for the requested dates from our inventory providers (Amadeus / Hotelbeds).
@@ -788,14 +938,11 @@ YOUR TASK:
                 "note": ["No real-time hotel inventory for requested dates"],
             }
 
-        # 2.4 有部分结果（不一定三种都有），且没有航班 / 活动 API 错误
         elif has_any_results:
             tool_results_for_prompt = {
                 "flights": [f.model_dump() for f in all_options.get("flights", [])],
                 "hotels": [h.model_dump() for h in all_options.get("hotels", [])],
-                "activities": [
-                    a.model_dump() for a in all_options.get("activities", [])
-                ],
+                "activities": [a.model_dump() for a in all_options.get("activities", [])],
             }
             synthesis_prompt = f"""You are an AI travel assistant.You MUST respond in **English**.
 Present these search results clearly.
@@ -809,7 +956,6 @@ Organize and present options in a user-friendly format.
 """
             hubspot_recommendations = tool_results_for_prompt
 
-        # 2.5 完全没有结果：区分“真没结果”与“API 挂了”（航班 / 活动任意一个）
         else:
             if flight_error_message or activity_error_message:
                 failure_msgs = []
@@ -870,25 +1016,12 @@ Offer specific ways to adjust:
         )
 
     # 邮件通知
-    # customer_info = state.get("customer_info") or {}
     to_email = customer_info.get("email")
-
     if to_email:
         try:
-            subject = (
-                f"Your AI travel plan to {travel_plan.destination}"
-                if travel_plan
-                else "Your AI travel plan"
-            )
+            subject = f"Your AI travel plan to {travel_plan.destination}" if travel_plan else "Your AI travel plan"
             body = getattr(final_response, "content", str(final_response))
-
-            await send_email_notification.ainvoke(
-                {
-                    "to_email": to_email,
-                    "subject": subject,
-                    "body": body,
-                },
-            )
+            await send_email_notification.ainvoke({"to_email": to_email, "subject": subject, "body": body})
             print(f"✓ Email sent to customer email: {to_email}")
         except Exception as e:
             print(f"✗ Failed to send email to customer: {e}")
@@ -900,4 +1033,5 @@ Offer specific ways to adjust:
         "current_step": "complete",
         "form_to_display": None,
     }
+
 
