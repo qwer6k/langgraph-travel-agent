@@ -3,18 +3,18 @@ import json
 import random
 import functools
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Literal, Any
-
+from typing import List, Dict, Optional, Literal, Any, Awaitable
 import httpx
 from amadeus import ResponseError
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
-
+from langchain_core.messages import AIMessage, ToolMessage
 from .config import amadeus, llm, EMAIL_SENDER, EMAIL_PASSWORD, HUBSPOT_API_KEY, hotelbeds_headers
 from .schemas import (
     FlightOption,
     HotelOption,
     ActivityOption,
+    TravelAgentState,
     TravelPlan,
     TravelPackage,
     TravelPackageList,
@@ -230,7 +230,40 @@ JSON Output:
 # ---------------------------------------------------------------------------
 # Travel plan update based on user feedback
 # ---------------------------------------------------------------------------
+# --- update_travel_plan.py (replace your function with this) ---
+import json
+import re
+from typing import Any, Dict, Optional
+from pydantic import ValidationError
+
+def _safe_load_json_obj(s: str) -> Optional[Dict[str, Any]]:
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+def _is_refresh_recommendation(text: str) -> bool:
+    t = (text or "").strip().lower()
+    # 中英常见“换一个/再给我几个/换个推荐”
+    if re.search(r"(换(一)?个|再(来|给)个|换个|再推荐|更多推荐|别的推荐|another|different)\s*(推荐|recommend)", t):
+        return True
+    # 极短但明确的“换一个推荐/换一个/再来一个”
+    if t in {"换一个推荐", "换个推荐", "换一个", "再来一个", "再推荐", "another one", "another", "different one"}:
+        return True
+    return False
+
 async def update_travel_plan(prev: TravelPlan, user_update: str) -> TravelPlan:
+    """
+    ✅ 稳健增量更新：
+    - 让 LLM 输出“patch”（只包含用户明确修改的字段）
+    - merge 到 prev 上（None/空字符串一律忽略，不允许把必填字段清空）
+    - 任何解析/校验失败：直接回退 prev
+    """
+    # “换一个推荐”这类不应触发结构化更新
+    if _is_refresh_recommendation(user_update):
+        return prev
+
     prompt = f"""
 You are updating an existing travel plan based on a user's new message.
 
@@ -243,16 +276,46 @@ USER UPDATE:
 RULES:
 - Keep any fields not mentioned by the user unchanged.
 - Only modify fields the user explicitly changes.
-- Output MUST be valid JSON matching this schema:
+- Output MUST be a JSON OBJECT that contains ONLY the fields that changed (a patch).
+- If the user did not change anything, output {{}}.
+- NEVER output null for any field. If unsure, OMIT the field.
+- Do NOT wrap in markdown. Output JSON only.
+
+For reference, the full schema is:
 {TravelPlan.model_json_schema()}
 
-JSON Output:
+JSON PATCH Output:
 """
-    resp = await llm.ainvoke(prompt)
-    raw = getattr(resp, "content", "")
-    json_str = _extract_json_object(raw)
-    return TravelPlan.model_validate_json(json_str)
+    try:
+        resp = await llm.ainvoke(prompt)
+        raw = getattr(resp, "content", "") or ""
+        json_str = _extract_json_object(raw)  # 你现有的提取函数
+        patch = _safe_load_json_obj(json_str) or {}
+    except Exception:
+        return prev
 
+    # 只允许 schema 内字段
+    allowed = set(prev.model_dump().keys())
+    patch = {k: v for k, v in patch.items() if k in allowed}
+
+    # merge：None / "" 一律忽略（避免清空 destination 这类必填字段）
+    merged = prev.model_dump()
+    for k, v in patch.items():
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        merged[k] = v
+
+    # 必填/关键字段兜底（防止模型仍然输出奇怪值）
+    for k in ("origin", "destination"):
+        if not merged.get(k):
+            merged[k] = getattr(prev, k)
+
+    try:
+        return TravelPlan.model_validate(merged)
+    except ValidationError:
+        return prev
 
 
 

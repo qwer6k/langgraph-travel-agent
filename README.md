@@ -260,11 +260,10 @@ npm start
 
 ### Required APIs
 
-### 1. Google Gemini (LLM)
+### 1. DeepSeek (LLM)
 
 ```bash
-# Get your API key: https://aistudio.google.com/app/apikey
-GOOGLE_API_KEY=your_key_here
+DEEPSEEK_API_KEY=your_key_here
 
 ```
 
@@ -288,17 +287,7 @@ HOTELBEDS_API_SECRET=your_secret_here
 
 ```
 
-### 4. Twilio (SMS Notifications)
-
-```bash
-# Get credentials: https://www.twilio.com/console
-TWILIO_ACCOUNT_SID=your_sid_here
-TWILIO_AUTH_TOKEN=your_token_here
-TWILIO_SENDER_PHONE=+1234567890
-
-```
-
-### 5. HubSpot (CRM - Default)
+### 4. HubSpot (CRM - Default)
 
 ```bash
 # Get API key: https://app.hubspot.com/integrations-settings/api-key
@@ -400,69 +389,6 @@ response2 = await graph.ainvoke({
 
 ```
 
----
-
-## 🎨 Customization
-
-### Change CRM Provider
-
-The system uses HubSpot by default but can be easily adapted to any CRM:
-
-### Option 1: Salesforce
-
-```python
-# In agent_graph.py, modify send_to_hubspot function:
-
-async def send_to_crm(...):
-    # Change API endpoint
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://yourinstance.salesforce.com/services/data/v58.0/sobjects/Opportunity",
-            headers={"Authorization": f"Bearer {SALESFORCE_API_KEY}"},
-            json={
-                "Name": f"AI Plan: {travel_plan.destination}",
-                "Amount": travel_plan.total_budget,
-                # ... map to Salesforce fields
-            }
-        )
-
-```
-
-### Option 2: Pipedrive
-
-```python
-async def send_to_crm(...):
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"https://api.pipedrive.com/v1/deals?api_token={PIPEDRIVE_API_KEY}",
-            json={
-                "title": f"AI Plan: {travel_plan.destination}",
-                "value": travel_plan.total_budget,
-                # ... map to Pipedrive fields
-            }
-        )
-
-```
-
-### Customize Package Generation
-
-Modify the `generate_travel_packages` function:
-
-```python
-# Change number of packages
-# In generation_prompt, update:
-"Create FIVE packages (Budget, Economy, Balanced, Premium, Luxury)"
-
-# Change package naming
-# Update TravelPackage model:
-grade: Literal["Budget", "Economy", "Balanced", "Premium", "Luxury"]
-
-# Add custom package logic
-if trip_plan.duration_days > 7:
-    # Generate extended trip packages
-    pass
-
-```
 
 ### Add Custom Tools
 
@@ -487,28 +413,6 @@ tools = [
 
 ```
 
-### Modify LLM Provider
-
-```python
-# Change from Gemini to OpenAI
-from langchain_openai import ChatOpenAI
-
-llm = ChatOpenAI(
-    model="gpt-4",
-    temperature=0,
-    openai_api_key=os.getenv("OPENAI_API_KEY")
-)
-
-# Or use Anthropic Claude
-from langchain_anthropic import ChatAnthropic
-
-llm = ChatAnthropic(
-    model="claude-3-opus-20240229",
-    temperature=0,
-    anthropic_api_key=os.getenv("ANTHROPIC_API_KEY")
-)
-
-```
 
 ---
 
@@ -654,40 +558,6 @@ async with httpx.AsyncClient(
 
 ---
 
-## 🧪 Testing
-
-```python
-# test_agent.py
-import pytest
-from agent_graph import build_enhanced_graph
-from langchain_core.messages import HumanMessage
-
-@pytest.mark.asyncio
-async def test_flight_search():
-    graph = build_enhanced_graph()
-    response = await graph.ainvoke({
-        'messages': [HumanMessage(
-            content="Find flights from NYC to Paris on June 1"
-        )]
-    })
-
-    assert response['messages'][-1].content
-    assert 'Paris' in response['messages'][-1].content
-
-@pytest.mark.asyncio
-async def test_package_generation():
-    graph = build_enhanced_graph()
-    response = await graph.ainvoke({
-        'messages': [HumanMessage(
-            content="Plan a 5-day trip to Tokyo for $3000"
-        )],
-        'customer_info': {'budget': '3000'}
-    })
-
-    content = response['messages'][-1].content
-    assert 'Budget' in content or 'Balanced' in content
-
-# Run: pytest test_agent.py
 
 ```
 
@@ -703,14 +573,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - Built with [LangGraph](https://github.com/langchain-ai/langgraph)
 - Powered by [Amadeus Travel APIs](https://developers.amadeus.com/)
-- LLM inference via [Google Gemini](https://ai.google.dev/)
 
----
 
-## 📧 Support
 
-- **Email**: [2.harim.choi@gmail.com](mailto:2.harim.choi@gmail.com)
 
----
 
-**Star ⭐ this repo if you find it useful!**
+
+

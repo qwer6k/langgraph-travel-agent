@@ -30,12 +30,15 @@ from .city_maps import (
 # 内部工具函数
 # -----------------------------------------------------------------------------
 
+import re
+
 def _is_iata_code(text: str) -> bool:
-    """判断字符串是不是形如 'PEK' 这样的 3 位大写字母 IATA 码。"""
+    """只允许 ASCII 大写 3 字母，例如 'PEK'"""
     if not text:
         return False
-    text = text.strip()
-    return len(text) == 3 and text.isalpha() and text.upper() == text
+    t = text.strip()
+    return bool(re.fullmatch(r"[A-Z]{3}", t))
+
 
 
 def _norm_key(text: str) -> str:
