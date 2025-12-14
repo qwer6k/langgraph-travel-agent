@@ -37,7 +37,7 @@ def _is_iata_code(text: str) -> bool:
     if not text:
         return False
     t = text.strip()
-    return bool(re.fullmatch(r"[A-Z]{3}", t))
+    return len(t) == 3 and t.isascii() and t.isalpha()
 
 
 
