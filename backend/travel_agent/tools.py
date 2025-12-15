@@ -868,26 +868,12 @@ async def search_and_compare_hotels(
         actual_city_code = await flexible_city_code(amadeus, city_code)
     except ValueError as e:
         print(f"✗ Entry validation: {e}")
-        return _hotel_error_placeholder(
-            "Input",
-            f"Invalid city_code: {e}",
-        )
-
+        return _hotel_error_placeholder("Input", f"Invalid city_code: {e}")
 
     print(f"→ Hotel search: {city_code} → {actual_city_code}")
 
-    amadeus_task = _search_amadeus_hotels(
-        actual_city_code,
-        check_in_date,
-        check_out_date,
-        adults,
-    )
-    hotelbeds_task = _search_hotelbeds_hotels(
-        actual_city_code,
-        check_in_date,
-        check_out_date,
-        adults,
-    )
+    amadeus_task = _search_amadeus_hotels(actual_city_code, check_in_date, check_out_date, adults)
+    hotelbeds_task = _search_hotelbeds_hotels(actual_city_code, check_in_date, check_out_date, adults)
 
     results = await asyncio.gather(amadeus_task, hotelbeds_task, return_exceptions=True)
 
@@ -897,11 +883,6 @@ async def search_and_compare_hotels(
             combined_list.extend(_hotel_error_placeholder("HotelSearch", f"Unexpected error: {r!r}"))
         else:
             combined_list.extend(r)
-
-
-    combined_list: List[HotelOption] = []
-    for result_list in results:
-        combined_list.extend(result_list)
 
     print(f"✓ Total hotels found: {len(combined_list)}")
     return combined_list
@@ -977,13 +958,7 @@ async def search_activities_by_city(city_name: str) -> List[ActivityOption]:
                 break
 
         if not qualified_activities:
-            return [
-                ActivityOption(
-                    name="No activities found",
-                    description="Unable to find activities",
-                    price="N/A",
-                ),
-            ]
+            return []
 
         print(f"✓ Found {len(qualified_activities)} activities")
         return qualified_activities
