@@ -139,17 +139,17 @@ def _is_one_way_request(text: str) -> bool:
     return any(re.search(p, t, flags=re.IGNORECASE) for p in patterns)
 
 
-# =============================================================================
-# key helpers
-# =============================================================================
-
 def _compute_tool_key(tool_name: str, travel_plan: TravelPlan, **kwargs) -> str:
     """
     为工具调用生成唯一指纹 key（由该工具依赖的 plan 字段值拼接后 hash）
-    NOTE: 这里约定 key 始终基于“语义参数”（origin/destination 文本），而不是 IATA/city_code。
+    NOTE:
+    - key 始终基于“语义参数”（origin/destination 文本），而不是 IATA/city_code。
+    - one_way 只使用“最终执行策略”（final policy），不使用 one_way_detected。
+      （你现在策略强制往返，则 key 永远 round_trip）
     """
     parts: List[str] = []
     if tool_name == "search_flights":
+        one_way_final = bool(kwargs.get("one_way", False))
         parts.extend([
             str(kwargs.get("originLocationCode") or travel_plan.origin or ""),
             str(kwargs.get("destinationLocationCode") or travel_plan.destination or ""),
@@ -159,7 +159,7 @@ def _compute_tool_key(tool_name: str, travel_plan: TravelPlan, **kwargs) -> str:
             str(travel_plan.travel_class or ""),
             str(travel_plan.departure_time_pref or ""),
             str(travel_plan.arrival_time_pref or ""),
-            "one_way" if kwargs.get("one_way") else "round_trip",
+            "one_way" if one_way_final else "round_trip",
         ])
     elif tool_name == "search_and_compare_hotels":
         parts.extend([
@@ -192,6 +192,7 @@ def _extract_tool_key_from_call_id(tool_call_id: str) -> Optional[str]:
 def _semantic_key_kwargs_for_tool(travel_plan: TravelPlan, tool_name: str, one_way: bool) -> Dict[str, Any]:
     """
     ✅ 用于 key 的参数永远是“语义参数”，不使用 IATA/city_code。
+    ✅ one_way 是“最终执行策略”（final policy），不使用 one_way_detected。
     """
     if tool_name == "search_flights":
         return {
@@ -203,7 +204,7 @@ def _semantic_key_kwargs_for_tool(travel_plan: TravelPlan, tool_name: str, one_w
             "travelClass": travel_plan.travel_class,
             "departureTime": travel_plan.departure_time_pref,
             "arrivalTime": travel_plan.arrival_time_pref,
-            "one_way": one_way,
+            "one_way": bool(one_way),
         }
     if tool_name == "search_and_compare_hotels":
         return {
@@ -234,6 +235,7 @@ def _tool_content_is_all_error_placeholders(tool_content: str) -> bool:
         if not item.get("is_error", False):
             return False
     return True
+
 
 
 # =============================================================================
@@ -308,10 +310,8 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
     """
     print("━━━ NODE: Analysis & Execution (PR2 Node1-4) ━━━")
 
-    one_way = state.get("one_way", False)
-
     # ------------------------------
-    # 获取 last_user_text
+    # 获取 last_user_text（必须最先做）
     # ------------------------------
     last_user_text = ""
     try:
@@ -319,6 +319,16 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             last_user_text = state["messages"][-1].content
     except Exception:
         last_user_text = ""
+
+    # ------------------------------
+    # one-way 检测：仅用于日志/解释
+    # 产品策略：强制往返
+    # ------------------------------
+    one_way_detected = _is_one_way_request(last_user_text)
+    one_way = False  # ✅ final execution policy (forced round-trip)
+
+    if one_way_detected:
+        print("→ one_way_detected=True, but product policy forces round-trip (one_way=False)")
 
     # ------------------------------
     # 低信息拦截
@@ -329,6 +339,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             "current_step": "complete",
             "form_to_display": None,
             "one_way": one_way,
+            "one_way_detected": one_way_detected,
             "last_tool_args": state.get("last_tool_args") or {},
             "execution_plan": state.get("execution_plan"),
         }
@@ -344,6 +355,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             "form_to_display": "customer_info",
             "original_request": original_request,
             "one_way": one_way,
+            "one_way_detected": one_way_detected,
             "last_tool_args": state.get("last_tool_args") or {},
             "execution_plan": {"decision": "ASK", "ask": "customer_info", "tasks": []},
         }
@@ -374,10 +386,39 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             if getattr(travel_plan, "origin", None) in (None, ""):
                 travel_plan.origin = prev_plan.origin
 
-        # 默认出发地（保留你现有逻辑）
-        if not travel_plan.origin:
+
+        # ------------------------------
+        # NEW: deterministic intent override (防 LLM patch 把活动问询写成 full_plan)
+        # ------------------------------
+        override_intent = _infer_intent_override(last_user_text)
+        if override_intent and override_intent != travel_plan.user_intent:
+            old = travel_plan.user_intent
+            travel_plan.user_intent = override_intent
+            print(f"→ intent overridden by heuristics: {old} → {override_intent}")
+
+        # ------------------------------
+        # CHANGED: intent change cleanup（改成统一走 helper）
+        # ------------------------------
+        if prev_plan is not None:
+            prev_intent = prev_plan.user_intent
+            new_intent = travel_plan.user_intent
+            intent_changed = prev_intent != new_intent
+
+            if intent_changed:
+                changed = _changed_fields(prev_plan, travel_plan)
+                _cleanup_inherited_fields_on_intent(
+                    travel_plan,
+                    new_intent,
+                    changed_fields=changed,
+                    user_text=last_user_text,
+                )
+
+
+        # CHANGED: 只有需要航班时才默认 origin
+        if travel_plan.user_intent in ["full_plan", "flights_only"] and not travel_plan.origin:
             travel_plan.origin = "Shanghai"
             print("→ Origin not provided, defaulting to Shanghai")
+
 
         # =========================================================================
         # Node3: ask_missing_core_fields (destination / dates)
@@ -394,6 +435,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
                     "form_to_display": None,
                     "travel_plan": travel_plan,
                     "one_way": one_way,
+                    "one_way_detected": one_way_detected,
                     "last_tool_args": state.get("last_tool_args") or {},
                     "user_followup_hint": user_followup_hint,
                     "execution_plan": {"decision": "ASK", "ask": ask_msg, "intent": travel_plan.user_intent, "tasks": []},
@@ -408,16 +450,26 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
                     "form_to_display": None,
                     "travel_plan": travel_plan,
                     "one_way": one_way,
+                    "one_way_detected": one_way_detected,
                     "last_tool_args": state.get("last_tool_args") or {},
                     "user_followup_hint": user_followup_hint,
                     "execution_plan": {"decision": "ASK", "ask": ask_msg, "intent": travel_plan.user_intent, "tasks": []},
                 }
 
-        # 写回 plan（通过 return 更新 state，更稳）
+        # =========================================================================
+        # Diff / rerun flags
+        # =========================================================================
         rerun_flights, rerun_hotels, rerun_activities = _compute_rerun_flags(prev_plan, travel_plan)
-        print(f"→ Rerun flags: flights={rerun_flights}, hotels={rerun_hotels}, activities={rerun_activities}")
-
         intent = travel_plan.user_intent if travel_plan else "full_plan"
+
+        # ✅ effective rerun：只表示“本轮真的会执行的工具”
+        eff_rerun_flights = rerun_flights and intent in ["full_plan", "flights_only"]
+        eff_rerun_hotels = rerun_hotels and intent in ["full_plan", "hotels_only"]
+        eff_rerun_activities = rerun_activities and intent in ["full_plan", "activities_only"]
+
+        print(f"→ Rerun flags (raw): flights={rerun_flights}, hotels={rerun_hotels}, activities={rerun_activities}")
+        print(f"→ Rerun flags (effective): flights={eff_rerun_flights}, hotels={eff_rerun_hotels}, activities={eff_rerun_activities}")
+
         reuse_tools = {
             "flights_only": ["search_flights"],
             "hotels_only": ["search_and_compare_hotels"],
@@ -426,32 +478,25 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
         }.get(intent, [])
 
         # =========================================================================
-        # Node4: build_execution_plan（PR2：只生成本轮“要跑哪些工具”的计划 + 执行一次）
+        # Node4: build_execution_plan
         # =========================================================================
         planned_tasks: List[str] = []
-        if rerun_flights and intent in ["full_plan", "flights_only"]:
+        if eff_rerun_flights:
             planned_tasks.append("search_flights")
-        if rerun_hotels and intent in ["full_plan", "hotels_only"]:
+        if eff_rerun_hotels:
             planned_tasks.append("search_and_compare_hotels")
-        if rerun_activities and intent in ["full_plan", "activities_only"]:
+        if eff_rerun_activities:
             planned_tasks.append("search_activities_by_city")
 
-        execution_plan = {
-            "decision": "EXECUTE",
-            "intent": intent,
-            "tasks": planned_tasks,
-        }
+        execution_plan = {"decision": "EXECUTE", "intent": intent, "tasks": planned_tasks}
 
         # ---------------------------------------------------------------------
-        # 旧逻辑：准备工具 + 复用 + 串行执行（保持系统行为稳定）
+        # 准备工具 + 复用 + 串行执行
         # ---------------------------------------------------------------------
         tasks_and_names: List[tuple[Awaitable, str, Dict[str, Any]]] = []
 
         departure_date = travel_plan.departure_date
         return_date = travel_plan.return_date
-
-        # （保持你当前逻辑）one-way 固定往返
-        one_way = False
 
         raw_origin = travel_plan.origin
         raw_dest = travel_plan.destination
@@ -459,13 +504,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
         key_args_update: Dict[str, Dict[str, Any]] = {}
 
         # ---- flights ----
-        if (
-            rerun_flights
-            and intent in ["full_plan", "flights_only"]
-            and raw_origin
-            and raw_dest
-            and departure_date
-        ):
+        if eff_rerun_flights and raw_origin and raw_dest and departure_date:
             from .location_utils import location_to_airport_code
             from .config import amadeus as amadeus_client
 
@@ -485,7 +524,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             }
             tasks_and_names.append((search_flights.ainvoke(flight_args), "search_flights", flight_args))
 
-            # ✅ key 用语义参数（raw_origin/raw_dest）
+            # ✅ key 用语义参数（raw_origin/raw_dest），one_way 用最终执行策略（forced round-trip）
             key_args_update["search_flights"] = {
                 "originLocationCode": raw_origin,
                 "destinationLocationCode": raw_dest,
@@ -499,16 +538,9 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             }
 
         # ---- hotels ----
-        # ✅ 重要：不在 node 里提前 flexible_city_code。因为你新 tool 内部会做“机场/城市名 -> city code”。
-        if (
-            rerun_hotels
-            and intent in ["full_plan", "hotels_only"]
-            and raw_dest
-            and departure_date
-            and return_date
-        ):
+        if eff_rerun_hotels and raw_dest and departure_date and return_date:
             hotel_args = {
-                "city_code": raw_dest,              # 直接传 raw dest，让 tool 自己转 code
+                "city_code": raw_dest,
                 "check_in_date": departure_date,
                 "check_out_date": return_date,
                 "adults": travel_plan.adults,
@@ -523,17 +555,22 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             }
 
         # ---- activities ----
-        if (
-            rerun_activities
-            and intent in ["full_plan", "activities_only"]
-            and raw_dest
-        ):
+        if eff_rerun_activities and raw_dest:
             act_args = {"city_name": raw_dest}
             tasks_and_names.append((search_activities_by_city.ainvoke(act_args), "search_activities_by_city", act_args))
             key_args_update["search_activities_by_city"] = {"city_name": raw_dest}
 
-        # 合并 last_tool_args
+        # 合并 last_tool_args（并按 intent 过滤，避免无关缓存污染）
+        allowed_tools_for_intent = {
+            "flights_only": {"search_flights"},
+            "hotels_only": {"search_and_compare_hotels"},
+            "activities_only": {"search_activities_by_city"},
+            "full_plan": {"search_flights", "search_and_compare_hotels", "search_activities_by_city"},
+        }.get(intent, set())
+
         prev_last_args = state.get("last_tool_args") or {}
+        prev_last_args = {k: v for k, v in prev_last_args.items() if k in allowed_tools_for_intent}
+
         merged_last_args = dict(prev_last_args)
         merged_last_args.update(key_args_update)
 
@@ -550,6 +587,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
                     "form_to_display": None,
                     "tools_used": reuse_tools,
                     "one_way": one_way,
+                    "one_way_detected": one_way_detected,
                     "last_tool_args": merged_last_args,
                     "user_followup_hint": user_followup_hint,
                     "execution_plan": {**execution_plan, "tasks": []},
@@ -561,6 +599,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
                 "travel_plan": travel_plan,
                 "form_to_display": None,
                 "one_way": one_way,
+                "one_way_detected": one_way_detected,
                 "last_tool_args": merged_last_args,
                 "user_followup_hint": user_followup_hint,
                 "execution_plan": {**execution_plan, "tasks": []},
@@ -613,7 +652,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
 
             key_kwargs = dict((merged_last_args or {}).get(tool_name, {}) or {})
             if tool_name == "search_flights":
-                key_kwargs["one_way"] = one_way
+                key_kwargs["one_way"] = one_way  # ✅ use final policy only
 
             current_tool_key = _compute_tool_key(tool_name, travel_plan, **key_kwargs)
 
@@ -648,6 +687,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             "form_to_display": None,
             "tools_used": reuse_tools,
             "one_way": one_way,
+            "one_way_detected": one_way_detected,
             "last_tool_args": merged_last_args,
             "user_followup_hint": user_followup_hint,
             "execution_plan": execution_plan,
@@ -660,6 +700,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             "current_step": "complete",
             "form_to_display": None,
             "one_way": one_way,
+            "one_way_detected": one_way_detected,
             "last_tool_args": state.get("last_tool_args") or {},
             "execution_plan": state.get("execution_plan"),
         }
@@ -671,14 +712,114 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             "current_step": "complete",
             "form_to_display": None,
             "one_way": one_way,
+            "one_way_detected": one_way_detected,
             "last_tool_args": state.get("last_tool_args") or {},
             "execution_plan": state.get("execution_plan"),
         }
 
 
+
 # ------------------------------------------------------------------------------
 # Budget helpers（保持你原实现）
 # ------------------------------------------------------------------------------
+import re
+from typing import Optional, Literal, Set
+
+Intent = Literal["full_plan", "flights_only", "hotels_only", "activities_only"]
+
+# -----------------------------
+# NEW: deterministic intent inference
+# -----------------------------
+def _hit_any(patterns: list[str], text: str) -> bool:
+    t = (text or "")
+    return any(re.search(p, t, flags=re.IGNORECASE) for p in patterns)
+
+def _text_mentions_date(text: str) -> bool:
+    # 简单够用：YYYY-MM-DD / 常见中文相对日期
+    return _hit_any(
+        [
+            r"\b20\d{2}-\d{2}-\d{2}\b",
+            r"明天|后天|今天|今晚|下周|下星期|周一|周二|周三|周四|周五|周六|周日",
+            r"\d+\s*晚|\d+\s*天",
+        ],
+        text,
+    )
+
+def _infer_intent_override(text: str) -> Optional[Intent]:
+    """
+    ✅ 防止 LLM patch 乱改 user_intent：当用户文本语义非常明确时，用规则覆盖 intent。
+    """
+    # 关键词你可以按业务再补
+    act_kw = [r"当地体验", r"体验项目", r"体验", r"有什么好玩", r"玩什么", r"活动", r"things to do", r"\bactivities?\b"]
+    flight_kw = [r"航班", r"机票", r"飞", r"单程", r"往返", r"商务舱", r"经济舱", r"\bflight(s)?\b", r"one[-\s]?way"]
+    hotel_kw = [r"酒店", r"住宿", r"\bhotel(s)?\b", r"stay", r"四星|五星|星级"]
+
+    has_act = _hit_any(act_kw, text)
+    has_flight = _hit_any(flight_kw, text)
+    has_hotel = _hit_any(hotel_kw, text)
+
+    # ✅ 只有当“单一目标非常明确”时才覆盖（避免误伤）
+    if has_act and not has_flight and not has_hotel:
+        return "activities_only"
+    if has_flight and not has_hotel and not has_act:
+        return "flights_only"
+    if has_hotel and not has_flight and not has_act:
+        return "hotels_only"
+    return None
+
+def _cleanup_inherited_fields_on_intent(
+    travel_plan: TravelPlan,
+    new_intent: Intent,
+    *,
+    changed_fields: Set[str],
+    user_text: str,
+) -> None:
+    """
+    ✅ intent 变化时清理“不该继承 / 高风险继承”的字段
+    规则：
+    - 只清理本轮没有被用户显式更新的字段（不覆盖用户刚给的值）
+    - hotels_only / activities_only：origin 一律不要继承（否则后面 full_plan 会拿到旧出发地）
+    - flights_only / hotels_only：dates/duration 高风险继承（没更新就清掉，迫使追问）
+    - activities_only：dates 不强制需要；若用户没提日期则清掉（避免污染后续 full_plan）
+    """
+    def clear_if_not_changed(field: str):
+        if field not in changed_fields:
+            setattr(travel_plan, field, None)
+
+    if new_intent == "activities_only":
+        # 不需要的“航班相关”全部不要继承
+        clear_if_not_changed("origin")
+        clear_if_not_changed("travel_class")
+        clear_if_not_changed("departure_time_pref")
+        clear_if_not_changed("arrival_time_pref")
+        clear_if_not_changed("total_budget")
+
+        # dates：用户没提日期就清掉，避免继承污染；用户提了日期就保留（以后切 full_plan 可用）
+        if not _text_mentions_date(user_text):
+            clear_if_not_changed("departure_date")
+            clear_if_not_changed("return_date")
+            clear_if_not_changed("duration_days")
+
+    elif new_intent == "hotels_only":
+        # 酒店不需要 origin / 航班偏好
+        clear_if_not_changed("origin")
+        clear_if_not_changed("travel_class")
+        clear_if_not_changed("departure_time_pref")
+        clear_if_not_changed("arrival_time_pref")
+
+        # dates 高风险继承：没更新就清掉 -> 触发追问
+        clear_if_not_changed("departure_date")
+        clear_if_not_changed("return_date")
+        clear_if_not_changed("duration_days")
+
+    elif new_intent == "flights_only":
+        # flights 仍然需要 origin/destination/dates，但 dates 也属于高风险继承
+        clear_if_not_changed("departure_date")
+        clear_if_not_changed("return_date")
+        clear_if_not_changed("duration_days")
+
+    # full_plan：不额外清理（你已有逻辑会在 rerun + ask gate 控制）
+
 
 def _parse_budget_to_float(raw: object) -> Optional[float]:
     if raw is None:
@@ -734,6 +875,11 @@ async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
         }.get(intent, set())
 
     one_way = state.get("one_way", False)
+
+    # ✅ PR2: derive allowed categories (用于合成裁剪)
+    allow_flights = "search_flights" in allowed_tools
+    allow_hotels = "search_and_compare_hotels" in allowed_tools
+    allow_activities = "search_activities_by_city" in allowed_tools
 
     current_keys: Dict[str, str] = {}
     if travel_plan:
@@ -809,6 +955,44 @@ YOUR TASK:
             final_response = AIMessage(
                 content="I apologize, but I encountered an issue generating your recommendations. Please try again."
             )
+
+        # ✅ PR2: prune output by allowed_tools (不改 prompt，只裁剪输出段落)
+        def _prune_response_by_allowed_tools(text: str) -> str:
+            import re
+            if not text:
+                return text
+
+            out = text
+
+            def _strip_section_md(title_regex: str) -> None:
+                nonlocal out
+                # Match markdown headings like "## Hotels" until next heading or end
+                pat = re.compile(rf"(?is)\n#+\s*{title_regex}\b.*?(?=\n#+\s|\Z)")
+                out = re.sub(pat, "\n", out)
+
+            def _strip_section_emoji(emoji: str) -> None:
+                nonlocal out
+                # Match blocks starting with emoji line until next emoji/heading/end
+                pat = re.compile(rf"(?is)\n{re.escape(emoji)}.*?(?=\n(?:✈️|🏨|🎡|\n#+\s)|\Z)")
+                out = re.sub(pat, "\n", out)
+
+            # remove disallowed categories
+            if not allow_flights:
+                _strip_section_md(r"(Flights?|Flight Options?)")
+                _strip_section_emoji("✈️")
+            if not allow_hotels:
+                _strip_section_md(r"(Hotels?|Hotel Availability|Hotel Options?)")
+                _strip_section_emoji("🏨")
+            if not allow_activities:
+                _strip_section_md(r"(Activities|Things to do)")
+                _strip_section_emoji("🎡")
+
+            # cleanup excessive blank lines
+            out2 = re.sub(r"\n{3,}", "\n\n", out).strip()
+            return out2 if out2 else text
+
+        pruned = _prune_response_by_allowed_tools(getattr(final_response, "content", str(final_response)))
+        final_response = AIMessage(content=pruned)
 
         to_email = customer_info.get("email")
         if to_email:
@@ -896,6 +1080,31 @@ YOUR TASK:
         state["hotel_error_message"] = hotel_error_message
 
     packages: List[TravelPackage] = []
+    import re
+    from decimal import Decimal
+
+    _PRICE_RE = re.compile(r"(?P<amount>[\d,]+(?:\.\d+)?)\s*(?P<ccy>[A-Z]{3})?$")
+
+    def parse_price(s: str, default_ccy: str = "USD"):
+        s = (s or "").strip()
+        if s.startswith("$"):
+            s = s[1:].strip()
+            default_ccy = "USD"
+        m = _PRICE_RE.search(s.replace("USD", " USD").replace("JPY", " JPY").strip())
+        if not m:
+            return None
+        amt = Decimal(m.group("amount").replace(",", ""))
+        ccy = (m.group("ccy") or default_ccy).upper()
+        return amt, ccy
+
+    def convert_to_usd(amount: Decimal, ccy: str, fx: dict[str, Decimal]) -> Decimal:
+        ccy = ccy.upper()
+        if ccy == "USD":
+            return amount
+        if ccy not in fx:
+            raise ValueError(f"Missing FX rate for {ccy}->USD")
+        return amount * fx[ccy]
+
     if (
         travel_plan
         and travel_plan.user_intent == "full_plan"
@@ -1057,7 +1266,8 @@ YOUR TASK:
                 "note": ["Hotel API temporarily unavailable", hotel_error_message],
             }
 
-        elif flights_exist and not hotels_exist:
+        # ✅ PR2: 仅在“允许酒店的意图场景”才进入“无酒店库存”解释分支，避免 flights_only 误触发
+        elif flights_exist and (allow_hotels) and not hotels_exist:
             tool_results_for_prompt = {
                 "flights": [f.model_dump() for f in all_options.get("flights", [])],
                 "activities": [a.model_dump() for a in all_options.get("activities", [])],
@@ -1165,6 +1375,40 @@ Offer specific ways to adjust:
             content="I apologize, but I encountered an issue generating your recommendations. Please try again."
         )
 
+    # ✅ PR2: prune output by allowed_tools (不改 prompt，只裁剪输出段落)
+    def _prune_response_by_allowed_tools(text: str) -> str:
+        import re
+        if not text:
+            return text
+
+        out = text
+
+        def _strip_section_md(title_regex: str) -> None:
+            nonlocal out
+            pat = re.compile(rf"(?is)\n#+\s*{title_regex}\b.*?(?=\n#+\s|\Z)")
+            out = re.sub(pat, "\n", out)
+
+        def _strip_section_emoji(emoji: str) -> None:
+            nonlocal out
+            pat = re.compile(rf"(?is)\n{re.escape(emoji)}.*?(?=\n(?:✈️|🏨|🎡|\n#+\s)|\Z)")
+            out = re.sub(pat, "\n", out)
+
+        if not allow_flights:
+            _strip_section_md(r"(Flights?|Flight Options?)")
+            _strip_section_emoji("✈️")
+        if not allow_hotels:
+            _strip_section_md(r"(Hotels?|Hotel Availability|Hotel Options?)")
+            _strip_section_emoji("🏨")
+        if not allow_activities:
+            _strip_section_md(r"(Activities|Things to do)")
+            _strip_section_emoji("🎡")
+
+        out2 = re.sub(r"\n{3,}", "\n\n", out).strip()
+        return out2 if out2 else text
+
+    pruned = _prune_response_by_allowed_tools(getattr(final_response, "content", str(final_response)))
+    final_response = AIMessage(content=pruned)
+
     to_email = customer_info.get("email")
     if to_email:
         try:
@@ -1182,3 +1426,4 @@ Offer specific ways to adjust:
         "current_step": "complete",
         "form_to_display": None,
     }
+

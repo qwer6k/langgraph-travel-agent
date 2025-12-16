@@ -138,6 +138,7 @@ class TravelAgentState(TypedDict):
     trip_details: Optional[Dict[str, Any]]
     original_request: Optional[str]
     is_continuation: Optional[bool]
+    one_way_detected: Optional[bool]
 
     # ---- PR2 additions (important) ----
     one_way: Optional[bool]

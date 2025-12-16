@@ -253,14 +253,57 @@ def _is_refresh_recommendation(text: str) -> bool:
         return True
     return False
 
+import re
+import json
+from typing import Optional
+from pydantic import ValidationError
+
+def _infer_intent_from_text(user_update: str) -> Optional[str]:
+    """
+    规则推断 intent：
+    - 明确 only 指令优先
+    - 否则出现航班/路线语义 -> 倾向 full_plan（除非明确 only hotels）
+    """
+    t = (user_update or "").strip().lower()
+
+    # only patterns
+    hotel_only = re.search(r"(只|仅|只想|只要).{0,6}(酒店|住宿|宾馆|hotel)", t)
+    flight_only = re.search(r"(只|仅|只想|只要).{0,6}(航班|机票|flight|flights)", t)
+    act_only = re.search(r"(只|仅|只想|只要).{0,6}(活动|行程|景点|tour|things to do|activity)", t)
+
+    if hotel_only:
+        return "hotels_only"
+    if flight_only:
+        return "flights_only"
+    if act_only:
+        return "activities_only"
+
+    # signals
+    has_flight_signal = bool(re.search(r"(往返|单程|飞|航班|机票|商务舱|经济舱|头等舱|round\s*trip|one\s*way)", t))
+    has_route_signal = bool(re.search(r"(从.+到.+)", t)) or ("到" in t and "飞" in t)
+    has_stay_signal = bool(re.search(r"(住|入住|酒店|住宿|待\s*\d+\s*(晚|天))", t))
+    has_date_signal = bool(re.search(r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}", t))
+
+    # 只要出现明显“航班/路线”语义，且没有 only 限制，通常用户期待 full_plan
+    if (has_flight_signal or has_route_signal) and (has_stay_signal or has_date_signal):
+        return "full_plan"
+
+    # 如果只有航班语义但没提住宿/活动，也可保守给 flights_only
+    if has_flight_signal or has_route_signal:
+        return "flights_only"
+
+    # 默认不推断（保持原 intent）
+    return None
+
+
 async def update_travel_plan(prev: TravelPlan, user_update: str) -> TravelPlan:
     """
     ✅ 稳健增量更新：
-    - 让 LLM 输出“patch”（只包含用户明确修改的字段）
-    - merge 到 prev 上（None/空字符串一律忽略，不允许把必填字段清空）
-    - 任何解析/校验失败：直接回退 prev
+    - LLM 输出 patch
+    - merge 到 prev
+    - 额外：merge 后做 intent 纠偏（更符合产品直觉）
+    - 可选：大变更时直接重建 plan
     """
-    # “换一个推荐”这类不应触发结构化更新
     if _is_refresh_recommendation(user_update):
         return prev
 
@@ -289,16 +332,31 @@ JSON PATCH Output:
     try:
         resp = await llm.ainvoke(prompt)
         raw = getattr(resp, "content", "") or ""
-        json_str = _extract_json_object(raw)  # 你现有的提取函数
+        json_str = _extract_json_object(raw)
         patch = _safe_load_json_obj(json_str) or {}
     except Exception:
         return prev
 
-    # 只允许 schema 内字段
     allowed = set(prev.model_dump().keys())
     patch = {k: v for k, v in patch.items() if k in allowed}
 
-    # merge：None / "" 一律忽略（避免清空 destination 这类必填字段）
+    # -----------------------------
+    # (可选) 大变更 => 视为新需求
+    # -----------------------------
+    BIG_FIELDS = {"origin", "destination", "departure_date", "return_date", "duration_days", "adults", "total_budget"}
+    big_changed = len(set(patch.keys()) & BIG_FIELDS) >= 4 and ("destination" in patch or "origin" in patch)
+    if big_changed:
+        # 你也可以选择：return await enhanced_travel_analysis(user_update)
+        # 这里先给“更符合逻辑”的方案：直接重建
+        try:
+            new_plan = await enhanced_travel_analysis(user_update)
+            # 如果 new_plan 缺关键字段，再回退 prev（避免模型发散）
+            if not new_plan.destination:
+                return prev
+            return new_plan
+        except Exception:
+            pass  # fallback to patch merge
+
     merged = prev.model_dump()
     for k, v in patch.items():
         if v is None:
@@ -307,15 +365,25 @@ JSON PATCH Output:
             continue
         merged[k] = v
 
-    # 必填/关键字段兜底（防止模型仍然输出奇怪值）
     for k in ("origin", "destination"):
         if not merged.get(k):
             merged[k] = getattr(prev, k)
 
+
+
+    # -----------------------------
+    # ✅ intent 纠偏（核心）
+    # -----------------------------
+    inferred = _infer_intent_from_text(user_update)
+    if inferred:
+        merged["user_intent"] = inferred
+    print("→ patch keys:", sorted(patch.keys()))
+    print("→ final intent:", merged.get("user_intent"), "inferred:", inferred)
     try:
         return TravelPlan.model_validate(merged)
     except ValidationError:
         return prev
+
 
 
 
