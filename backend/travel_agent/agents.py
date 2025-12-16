@@ -1,144 +1,4 @@
-import asyncio
-import json
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Awaitable
-from langchain_core.messages import AIMessage, ToolMessage
-
-from .config import llm
-from .schemas import (
-    TravelAgentState,
-    TravelPlan,
-    FlightOption,
-    HotelOption,
-    ActivityOption,
-    TravelPackage,
-)
-from .tools import (
-    enhanced_travel_analysis,
-    update_travel_plan, 
-    search_flights,
-    search_and_compare_hotels,
-    search_activities_by_city,
-    generate_travel_packages,
-    send_to_hubspot,
-    send_email_notification,
-)
-import re
-from typing import Optional
-
-def _is_cjk_char(ch: str) -> bool:
-    # CJK Unified Ideographs + 常见扩展区（够用即可）
-    code = ord(ch)
-    return (
-        0x4E00 <= code <= 0x9FFF
-        or 0x3400 <= code <= 0x4DBF
-        or 0x20000 <= code <= 0x2A6DF
-    )
-
-def _is_low_signal_user_input(text: Optional[str]) -> bool:
-    """
-    低信息/无意义输入判定：
-    - 全符号/表情/空白
-    - 过短且无时间/无地点/无旅行意图关键词
-    - 明显寒暄/确认类（hi/ok/thanks/好的/谢谢）
-    """
-    t = (text or "").strip()
-    if not t:
-        return True
-
-    # 1) 完全没有“可用字符”（字母/数字/CJK）
-    meaningful_count = sum(1 for c in t if c.isalnum() or _is_cjk_char(c))
-    if meaningful_count == 0:
-        return True
-
-    # 2) 常见寒暄/确认（这些不应触发复用）
-    if re.fullmatch(r"(hi|hello|hey|ok|okay|thanks|thank\s+you|test)\W*", t, flags=re.I):
-        return True
-    if t in {"好的", "谢谢", "OK", "ok", "嗯", "哈", "哈哈", "收到"}:
-        return True
-
-    # 3) 是否包含时间/日期线索
-    has_time = bool(re.search(
-        r"(\d{4}-\d{1,2}-\d{1,2})|(\d{1,2}\s*(月|/|-)\s*\d{1,2})|"
-        r"(today|tomorrow|next\s+week|next\s+\w+day)|"
-        r"(今天|明天|后天|下周|周[一二三四五六日天])",
-        t, flags=re.I
-    ))
-
-    # 4) 是否包含旅行意图关键词（中英都覆盖一些常见的）
-    has_travel_kw = bool(re.search(
-        r"\b(flight|flights|hotel|hotels|activity|activities|tour|itinerary|airport|"
-        r"business|economy|one[-\s]?way|round[-\s]?trip|budget|price)\b",
-        t, flags=re.I
-    )) or bool(re.search(
-        r"(机票|航班|酒店|住宿|活动|行程|预算|商务舱|经济舱|单程|往返|机场|高铁|火车)",
-        t
-    ))
-
-    # 5) 是否包含 CJK（很多城市名会是 CJK；即使短也可能有意义，如“东京”）
-    has_cjk = any(_is_cjk_char(c) for c in t)
-
-    # 6) 过短且无“时间/意图/地点线索” -> 低信息
-    if len(t) <= 4 and not (has_time or has_travel_kw or has_cjk):
-        return True
-
-    # 7) 符号占比过高（如 "@#$%^&*"、"???"）且无时间/意图
-    ratio = meaningful_count / max(1, len(t))
-    if ratio < 0.35 and not (has_time or has_travel_kw) and len(t) < 20:
-        return True
-
-    return False
-
-import hashlib
-
-
-
-def _compute_rerun_flags(prev: Optional[TravelPlan], new: TravelPlan) -> tuple[bool, bool, bool]:
-    """
-    返回 (rerun_flights, rerun_hotels, rerun_activities)
-    prev 为 None 表示首次规划：全跑。
-    """
-    if prev is None:
-        return True, True, True
-
-    changed = _changed_fields(prev, new)
-
-    flights_deps = {
-        "origin", "destination", "departure_date", "return_date",
-        "adults", "travel_class", "departure_time_pref", "arrival_time_pref","user_intent", 
-    }
-    hotels_deps = {"destination", "departure_date", "return_date", "adults","user_intent", }
-    activities_deps = {"destination", "user_intent", }
-
-    rerun_flights = bool(changed & flights_deps)
-    rerun_hotels = bool(changed & hotels_deps)
-    rerun_activities = bool(changed & activities_deps)
-
-    # ✅ 只改预算：不重跑工具，复用历史 ToolMessage
-    if changed == {"total_budget"}:
-        rerun_flights = rerun_hotels = rerun_activities = False
-
-    return rerun_flights, rerun_hotels, rerun_activities
-
-
-def _is_one_way_request(text: str) -> bool:
-    import re
-    t = (text or "").strip().lower()
-    patterns = [
-        r"单程",
-        r"单向",
-        r"one[-\s]?way",
-        r"\boneway\b",
-        r"只要去程",
-        r"只看去程",
-        r"不返程",
-    ]
-    return any(re.search(p, t, flags=re.IGNORECASE) for p in patterns)
-
-
-# ---------------------------------------------------------------------------
-# Main node
-# ---------------------------------------------------------------------------
+# backend/travel_agent/agents.py
 
 import asyncio
 import json
@@ -147,6 +7,7 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Awaitable, Tuple
 
+from pydantic import ValidationError
 from langchain_core.messages import AIMessage, ToolMessage
 
 from .config import llm
@@ -167,72 +28,68 @@ from .tools import (
     generate_travel_packages,
     send_to_hubspot,
     send_email_notification,
+    _is_refresh_recommendation,
 )
 
-# ------------------------------------------------------------------------------
-# key / diff helpers (保留你原有逻辑，只补几个更稳的工具函数)
-# ------------------------------------------------------------------------------
 
-def _compute_tool_key(tool_name: str, travel_plan: TravelPlan, **kwargs) -> str:
-    """
-    为工具调用生成唯一指纹 key（由该工具依赖的 plan 字段值拼接后 hash）
-    """
-    parts = []
-    if tool_name == "search_flights":
-        parts.extend([
-            kwargs.get("originLocationCode") or travel_plan.origin or "",
-            kwargs.get("destinationLocationCode") or travel_plan.destination or "",
-            kwargs.get("departureDate") or travel_plan.departure_date or "",
-            kwargs.get("returnDate") or travel_plan.return_date or "",
-            str(travel_plan.adults),
-            travel_plan.travel_class or "",
-            travel_plan.departure_time_pref or "",
-            travel_plan.arrival_time_pref or "",
-            "one_way" if kwargs.get("one_way") else "round_trip",
-        ])
-    elif tool_name == "search_and_compare_hotels":
-        parts.extend([
-            kwargs.get("city_code") or travel_plan.destination or "",
-            kwargs.get("check_in_date") or travel_plan.departure_date or "",
-            kwargs.get("check_out_date") or travel_plan.return_date or "",
-            str(travel_plan.adults),
-        ])
-    elif tool_name == "search_activities_by_city":
-        parts.extend([
-            kwargs.get("city_name") or travel_plan.destination or ""
-        ])
+# =============================================================================
+# Low-signal guard
+# =============================================================================
 
-    key_str = "|".join(str(p) for p in parts)
-    return hashlib.md5(key_str.encode()).hexdigest()[:8]
+def _is_cjk_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x4E00 <= code <= 0x9FFF
+        or 0x3400 <= code <= 0x4DBF
+        or 0x20000 <= code <= 0x2A6DF
+    )
 
 
-def _calculate_default_dates(travel_plan: TravelPlan) -> Tuple[str, str]:
-    """
-    根据当前时间 + duration 自动兜底出发/返回日期。
-    """
-    today = datetime.now()
-    default_checkin = today + timedelta(days=15)
-    default_checkout = default_checkin + timedelta(days=3)
+def _is_low_signal_user_input(text: Optional[str]) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
 
-    departure_date = travel_plan.departure_date
-    return_date = travel_plan.return_date
+    meaningful_count = sum(1 for c in t if c.isalnum() or _is_cjk_char(c))
+    if meaningful_count == 0:
+        return True
 
-    if not departure_date:
-        departure_date = default_checkin.strftime("%Y-%m-%d")
+    if re.fullmatch(r"(hi|hello|hey|ok|okay|thanks|thank\s+you|test)\W*", t, flags=re.I):
+        return True
+    if t in {"好的", "谢谢", "OK", "ok", "嗯", "哈", "哈哈", "收到"}:
+        return True
 
-    if not return_date:
-        if travel_plan.duration_days:
-            try:
-                dep_dt = datetime.strptime(departure_date, "%Y-%m-%d")
-                return_dt = dep_dt + timedelta(days=travel_plan.duration_days)
-                return_date = return_dt.strftime("%Y-%m-%d")
-            except ValueError:
-                return_date = default_checkout.strftime("%Y-%m-%d")
-        else:
-            return_date = default_checkout.strftime("%Y-%m-%d")
+    has_time = bool(re.search(
+        r"(\d{4}-\d{1,2}-\d{1,2})|(\d{1,2}\s*(月|/|-)\s*\d{1,2})|"
+        r"(today|tomorrow|next\s+week|next\s+\w+day)|"
+        r"(今天|明天|后天|下周|周[一二三四五六日天])",
+        t, flags=re.I
+    ))
 
-    return departure_date, return_date
+    has_travel_kw = bool(re.search(
+        r"\b(flight|flights|hotel|hotels|activity|activities|tour|itinerary|airport|"
+        r"business|economy|one[-\s]?way|round[-\s]?trip|budget|price)\b",
+        t, flags=re.I
+    )) or bool(re.search(
+        r"(机票|航班|酒店|住宿|活动|行程|预算|商务舱|经济舱|单程|往返|机场|高铁|火车)",
+        t
+    ))
 
+    has_cjk = any(_is_cjk_char(c) for c in t)
+
+    if len(t) <= 4 and not (has_time or has_travel_kw or has_cjk):
+        return True
+
+    ratio = meaningful_count / max(1, len(t))
+    if ratio < 0.35 and not (has_time or has_travel_kw) and len(t) < 20:
+        return True
+
+    return False
+
+
+# =============================================================================
+# Diff / rerun flags
+# =============================================================================
 
 def _changed_fields(prev: TravelPlan, new: TravelPlan) -> set[str]:
     a = prev.model_dump()
@@ -240,10 +97,89 @@ def _changed_fields(prev: TravelPlan, new: TravelPlan) -> set[str]:
     return {k for k in a.keys() if a.get(k) != b.get(k)}
 
 
+def _compute_rerun_flags(prev: Optional[TravelPlan], new: TravelPlan) -> tuple[bool, bool, bool]:
+    """
+    返回 (rerun_flights, rerun_hotels, rerun_activities)
+    prev 为 None 表示首次规划：全跑。
+    """
+    if prev is None:
+        return True, True, True
+
+    changed = _changed_fields(prev, new)
+
+    flights_deps = {
+        "origin", "destination", "departure_date", "return_date",
+        "adults", "travel_class", "departure_time_pref", "arrival_time_pref", "user_intent",
+    }
+    hotels_deps = {"destination", "departure_date", "return_date", "adults", "user_intent"}
+    activities_deps = {"destination", "user_intent"}
+
+    rerun_flights = bool(changed & flights_deps)
+    rerun_hotels = bool(changed & hotels_deps)
+    rerun_activities = bool(changed & activities_deps)
+
+    # ✅ 只改预算：不重跑工具
+    if changed == {"total_budget"}:
+        rerun_flights = rerun_hotels = rerun_activities = False
+
+    return rerun_flights, rerun_hotels, rerun_activities
+
+
+def _is_one_way_request(text: str) -> bool:
+    t = (text or "").strip().lower()
+    patterns = [
+        r"单程",
+        r"单向",
+        r"one[-\s]?way",
+        r"\boneway\b",
+        r"只要去程",
+        r"只看去程",
+        r"不返程",
+    ]
+    return any(re.search(p, t, flags=re.IGNORECASE) for p in patterns)
+
+
+# =============================================================================
+# key helpers
+# =============================================================================
+
+def _compute_tool_key(tool_name: str, travel_plan: TravelPlan, **kwargs) -> str:
+    """
+    为工具调用生成唯一指纹 key（由该工具依赖的 plan 字段值拼接后 hash）
+    NOTE: 这里约定 key 始终基于“语义参数”（origin/destination 文本），而不是 IATA/city_code。
+    """
+    parts: List[str] = []
+    if tool_name == "search_flights":
+        parts.extend([
+            str(kwargs.get("originLocationCode") or travel_plan.origin or ""),
+            str(kwargs.get("destinationLocationCode") or travel_plan.destination or ""),
+            str(kwargs.get("departureDate") or travel_plan.departure_date or ""),
+            str(kwargs.get("returnDate") or travel_plan.return_date or ""),
+            str(travel_plan.adults),
+            str(travel_plan.travel_class or ""),
+            str(travel_plan.departure_time_pref or ""),
+            str(travel_plan.arrival_time_pref or ""),
+            "one_way" if kwargs.get("one_way") else "round_trip",
+        ])
+    elif tool_name == "search_and_compare_hotels":
+        parts.extend([
+            str(kwargs.get("city_code") or travel_plan.destination or ""),
+            str(kwargs.get("check_in_date") or travel_plan.departure_date or ""),
+            str(kwargs.get("check_out_date") or travel_plan.return_date or ""),
+            str(travel_plan.adults),
+        ])
+    elif tool_name == "search_activities_by_city":
+        parts.extend([
+            str(kwargs.get("city_name") or travel_plan.destination or ""),
+        ])
+
+    key_str = "|".join(parts)
+    return hashlib.md5(key_str.encode()).hexdigest()[:8]
+
+
 def _extract_tool_key_from_call_id(tool_call_id: str) -> Optional[str]:
     """
     解析 tool_call_id，期望格式：call_<tool>:<key>:<index>
-    宽松：只要 >= 3 段，就取 parts[1] 作为 key。
     """
     if not tool_call_id:
         return None
@@ -255,8 +191,7 @@ def _extract_tool_key_from_call_id(tool_call_id: str) -> Optional[str]:
 
 def _semantic_key_kwargs_for_tool(travel_plan: TravelPlan, tool_name: str, one_way: bool) -> Dict[str, Any]:
     """
-    ✅ 关键：用于 key 的参数永远是“语义参数”，不使用 IATA/city_code。
-    这样 tool_call_id 与 synthesize 的 key 计算会稳定一致。
+    ✅ 用于 key 的参数永远是“语义参数”，不使用 IATA/city_code。
     """
     if tool_name == "search_flights":
         return {
@@ -290,10 +225,6 @@ def _safe_json_loads(s: str) -> Optional[Any]:
 
 
 def _tool_content_is_all_error_placeholders(tool_content: str) -> bool:
-    """
-    ✅ 安全兜底：如果 tool message 全是 is_error=true 的占位，拿来降级是安全的
-    （不会误展示错误的真实价格/库存）。
-    """
     data = _safe_json_loads(tool_content or "")
     if not isinstance(data, list) or not data:
         return False
@@ -305,15 +236,78 @@ def _tool_content_is_all_error_placeholders(tool_content: str) -> bool:
     return True
 
 
-# ------------------------------------------------------------------------------
-# Main node (可替换版本)
-# ------------------------------------------------------------------------------
-from pydantic import ValidationError
-from .tools import _is_refresh_recommendation
-async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
-    print("━━━ NODE: Analysis & Execution ━━━")
+# =============================================================================
+# PR2: date gate (no more default +15d)
+# =============================================================================
 
-    _ = state.get("is_continuation", False)
+def _parse_ymd(date_str: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _normalize_dates_or_ask(travel_plan: TravelPlan) -> Tuple[bool, str]:
+    """
+    PR2 关键变化：缺日期就追问，不再默认给“15天后”。
+    返回 (ok, ask_message)。
+    同时会尽量自动补齐 return_date / departure_date（当信息足够时）。
+    """
+    if not getattr(travel_plan, "destination", None):
+        return False, "Where are you traveling to (destination city/airport)?"
+
+    dep = travel_plan.departure_date
+    ret = travel_plan.return_date
+    dur = travel_plan.duration_days
+
+    dep_dt = _parse_ymd(dep) if dep else None
+    ret_dt = _parse_ymd(ret) if ret else None
+
+    if dep and not dep_dt:
+        return False, "What is your departure date? Please use YYYY-MM-DD (e.g., 2026-04-10)."
+    if ret and not ret_dt:
+        return False, "What is your return date? Please use YYYY-MM-DD (e.g., 2026-04-14)."
+
+    # dep + ret -> 补 duration
+    if dep_dt and ret_dt:
+        if ret_dt <= dep_dt:
+            return False, "Your return date must be after your departure date. Could you confirm the dates?"
+        if not dur:
+            travel_plan.duration_days = (ret_dt - dep_dt).days
+        return True, ""
+
+    # dep + duration -> 补 return
+    if dep_dt and dur:
+        if dur <= 0:
+            return False, "How many days is your trip (a positive number)?"
+        travel_plan.return_date = (dep_dt + timedelta(days=dur)).strftime("%Y-%m-%d")
+        return True, ""
+
+    # ret + duration -> 补 departure
+    if ret_dt and dur:
+        if dur <= 0:
+            return False, "How many days is your trip (a positive number)?"
+        travel_plan.departure_date = (ret_dt - timedelta(days=dur)).strftime("%Y-%m-%d")
+        return True, ""
+
+    return (
+        False,
+        "What are your travel dates (departure & return), or at least a departure date + trip duration (days)? "
+        "Example: '2026-04-10 to 2026-04-14' or 'depart 2026-04-10 for 4 days'."
+    )
+
+
+# =============================================================================
+# Main node: call_model_node (PR2 Node1~Node4 internally)
+# =============================================================================
+
+async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
+    """
+    不改 graph、不改对外接口：仍然只有一个 node。
+    但内部逻辑按 Node1~Node4 分段组织，便于 PR3 再做自治循环。
+    """
+    print("━━━ NODE: Analysis & Execution (PR2 Node1-4) ━━━")
+
     one_way = state.get("one_way", False)
 
     # ------------------------------
@@ -327,28 +321,23 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
         last_user_text = ""
 
     # ------------------------------
-    # ✅ 低信息拦截（避免误触发复用）
+    # 低信息拦截
     # ------------------------------
     if _is_low_signal_user_input(last_user_text):
-        messages = [AIMessage(content="Sorry—I didn't catch that. Could you please repeat your request in English?")]
         return {
-            "messages": messages,
+            "messages": [AIMessage(content="Sorry—I didn't catch that. Could you please repeat your request in English?")],
             "current_step": "complete",
             "form_to_display": None,
             "one_way": one_way,
             "last_tool_args": state.get("last_tool_args") or {},
+            "execution_plan": state.get("execution_plan"),
         }
 
-
-
-    # ------------------------------
-    # collecting_info gate
-    # ------------------------------
+    # =========================================================================
+    # Node1: ensure_customer_info
+    # =========================================================================
     if not state.get("customer_info"):
-        original_request = state.get("original_request")
-        if not original_request:
-            original_request = last_user_text
-
+        original_request = state.get("original_request") or last_user_text
         return {
             "messages": [],
             "current_step": "collecting_info",
@@ -356,50 +345,77 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             "original_request": original_request,
             "one_way": one_way,
             "last_tool_args": state.get("last_tool_args") or {},
+            "execution_plan": {"decision": "ASK", "ask": "customer_info", "tasks": []},
         }
 
     customer_info = state.get("customer_info", {}) or {}
 
     try:
-        # ==============================
-        # Phase 1: 解析/更新 TravelPlan
-        # ==============================
-        print("→ Phase 1: Analyzing request")
-
+        # =========================================================================
+        # Node2: parse_or_update_plan
+        # =========================================================================
         prev_plan: Optional[TravelPlan] = state.get("travel_plan")
 
-        # ✅ “换一个推荐/another recommendation” 不做结构化更新：直接沿用 prev_plan
         if prev_plan is not None and _is_refresh_recommendation(last_user_text):
             travel_plan = prev_plan
-            # 可选：给 synthesis 一个 hint（不改 synthesize 也不会报错）
-            state["user_followup_hint"] = "refresh_recommendation"
+            user_followup_hint = "refresh_recommendation"
         else:
+            user_followup_hint = None
             if prev_plan is None:
                 user_request = state.get("original_request") or last_user_text
                 travel_plan = await enhanced_travel_analysis(user_request)
             else:
                 travel_plan = await update_travel_plan(prev_plan, last_user_text)
 
-        # ✅ 防炸：update 之后再兜底一次（防 destination 被清空）
+        # update 后兜底（防 destination/origin 被清空）
         if prev_plan is not None:
             if getattr(travel_plan, "destination", None) in (None, ""):
                 travel_plan.destination = prev_plan.destination
             if getattr(travel_plan, "origin", None) in (None, ""):
                 travel_plan.origin = prev_plan.origin
 
-        # 默认出发地
+        # 默认出发地（保留你现有逻辑）
         if not travel_plan.origin:
             travel_plan.origin = "Shanghai"
             print("→ Origin not provided, defaulting to Shanghai")
 
-        if customer_info.get("budget"):
-            print(f"→ Budget captured (not injected in analysis): {customer_info.get('budget')}")
+        # =========================================================================
+        # Node3: ask_missing_core_fields (destination / dates)
+        #   - PR2：缺日期优先追问（不再默认 15 天后）
+        # =========================================================================
+        needs_dates = travel_plan.user_intent in ["full_plan", "flights_only", "hotels_only"]
 
+        if needs_dates:
+            ok, ask_msg = _normalize_dates_or_ask(travel_plan)
+            if not ok:
+                return {
+                    "messages": [AIMessage(content=ask_msg)],
+                    "current_step": "complete",
+                    "form_to_display": None,
+                    "travel_plan": travel_plan,
+                    "one_way": one_way,
+                    "last_tool_args": state.get("last_tool_args") or {},
+                    "user_followup_hint": user_followup_hint,
+                    "execution_plan": {"decision": "ASK", "ask": ask_msg, "intent": travel_plan.user_intent, "tasks": []},
+                }
+        else:
+            # activities_only：只需 destination
+            if not getattr(travel_plan, "destination", None):
+                ask_msg = "Where are you traveling to (destination city/airport)?"
+                return {
+                    "messages": [AIMessage(content=ask_msg)],
+                    "current_step": "complete",
+                    "form_to_display": None,
+                    "travel_plan": travel_plan,
+                    "one_way": one_way,
+                    "last_tool_args": state.get("last_tool_args") or {},
+                    "user_followup_hint": user_followup_hint,
+                    "execution_plan": {"decision": "ASK", "ask": ask_msg, "intent": travel_plan.user_intent, "tasks": []},
+                }
+
+        # 写回 plan（通过 return 更新 state，更稳）
         rerun_flights, rerun_hotels, rerun_activities = _compute_rerun_flags(prev_plan, travel_plan)
         print(f"→ Rerun flags: flights={rerun_flights}, hotels={rerun_hotels}, activities={rerun_activities}")
-
-        # 写回 plan
-        state["travel_plan"] = travel_plan
 
         intent = travel_plan.user_intent if travel_plan else "full_plan"
         reuse_tools = {
@@ -409,33 +425,33 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             "full_plan": ["search_flights", "search_and_compare_hotels", "search_activities_by_city"],
         }.get(intent, [])
 
-        # ==============================
-        # Phase 2: 准备要调用的工具（按 rerun gate）
-        # ==============================
-        print(f"→ Phase 2: Preparing tools (intent: {travel_plan.user_intent})")
+        # =========================================================================
+        # Node4: build_execution_plan（PR2：只生成本轮“要跑哪些工具”的计划 + 执行一次）
+        # =========================================================================
+        planned_tasks: List[str] = []
+        if rerun_flights and intent in ["full_plan", "flights_only"]:
+            planned_tasks.append("search_flights")
+        if rerun_hotels and intent in ["full_plan", "hotels_only"]:
+            planned_tasks.append("search_and_compare_hotels")
+        if rerun_activities and intent in ["full_plan", "activities_only"]:
+            planned_tasks.append("search_activities_by_city")
 
+        execution_plan = {
+            "decision": "EXECUTE",
+            "intent": intent,
+            "tasks": planned_tasks,
+        }
+
+        # ---------------------------------------------------------------------
+        # 旧逻辑：准备工具 + 复用 + 串行执行（保持系统行为稳定）
+        # ---------------------------------------------------------------------
         tasks_and_names: List[tuple[Awaitable, str, Dict[str, Any]]] = []
 
-        default_checkin, default_checkout = _calculate_default_dates(travel_plan)
-        departure_date = travel_plan.departure_date or default_checkin
-        return_date = travel_plan.return_date or default_checkout
+        departure_date = travel_plan.departure_date
+        return_date = travel_plan.return_date
 
-        # 日期合法性兜底
-        try:
-            datetime.strptime(departure_date, "%Y-%m-%d")
-            if return_date:
-                datetime.strptime(return_date, "%Y-%m-%d")
-        except ValueError as e:
-            print(f"⚠ Invalid date, using defaults: {e}")
-            departure_date = default_checkin
-            return_date = default_checkout
-
-        travel_plan.departure_date = departure_date
-        travel_plan.return_date = return_date
-
-        # one-way 固定往返（保持你当前逻辑）
+        # （保持你当前逻辑）one-way 固定往返
         one_way = False
-        state["one_way"] = False
 
         raw_origin = travel_plan.origin
         raw_dest = travel_plan.destination
@@ -445,9 +461,10 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
         # ---- flights ----
         if (
             rerun_flights
-            and travel_plan.user_intent in ["full_plan", "flights_only"]
+            and intent in ["full_plan", "flights_only"]
             and raw_origin
             and raw_dest
+            and departure_date
         ):
             from .location_utils import location_to_airport_code
             from .config import amadeus as amadeus_client
@@ -468,6 +485,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             }
             tasks_and_names.append((search_flights.ainvoke(flight_args), "search_flights", flight_args))
 
+            # ✅ key 用语义参数（raw_origin/raw_dest）
             key_args_update["search_flights"] = {
                 "originLocationCode": raw_origin,
                 "destinationLocationCode": raw_dest,
@@ -481,18 +499,16 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             }
 
         # ---- hotels ----
+        # ✅ 重要：不在 node 里提前 flexible_city_code。因为你新 tool 内部会做“机场/城市名 -> city code”。
         if (
             rerun_hotels
-            and travel_plan.user_intent in ["full_plan", "hotels_only"]
+            and intent in ["full_plan", "hotels_only"]
             and raw_dest
+            and departure_date
+            and return_date
         ):
-            from .location_utils import flexible_city_code
-            from .config import amadeus as amadeus_client
-
-            city_code = await flexible_city_code(amadeus_client, raw_dest)
-
             hotel_args = {
-                "city_code": city_code,
+                "city_code": raw_dest,              # 直接传 raw dest，让 tool 自己转 code
                 "check_in_date": departure_date,
                 "check_out_date": return_date,
                 "adults": travel_plan.adults,
@@ -509,22 +525,19 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
         # ---- activities ----
         if (
             rerun_activities
-            and travel_plan.user_intent in ["full_plan", "activities_only"]
+            and intent in ["full_plan", "activities_only"]
             and raw_dest
         ):
             act_args = {"city_name": raw_dest}
             tasks_and_names.append((search_activities_by_city.ainvoke(act_args), "search_activities_by_city", act_args))
             key_args_update["search_activities_by_city"] = {"city_name": raw_dest}
 
-        # 合并写回 last_tool_args（key 用语义参数）
+        # 合并 last_tool_args
         prev_last_args = state.get("last_tool_args") or {}
         merged_last_args = dict(prev_last_args)
         merged_last_args.update(key_args_update)
-        state["last_tool_args"] = merged_last_args
 
-        # ==============================
-        # Phase 2.5: 工具复用入口
-        # ==============================
+        # 工具复用入口
         has_any_tool_history = any(isinstance(m, ToolMessage) for m in state.get("messages", []))
 
         if not tasks_and_names:
@@ -537,31 +550,24 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
                     "form_to_display": None,
                     "tools_used": reuse_tools,
                     "one_way": one_way,
-                    "last_tool_args": state.get("last_tool_args") or {},
+                    "last_tool_args": merged_last_args,
+                    "user_followup_hint": user_followup_hint,
+                    "execution_plan": {**execution_plan, "tasks": []},
                 }
 
-            print("⚠ No tools to call and no previous tool history")
             return {
-                "messages": [
-                    AIMessage(
-                        content=(
-                            "I've understood your request, but there's no specific "
-                            "search I can perform. How else can I help?"
-                        )
-                    )
-                ],
+                "messages": [AIMessage(content="I've understood your request, but there's no specific search I can perform. How else can I help?")],
                 "current_step": "complete",
                 "travel_plan": travel_plan,
                 "form_to_display": None,
                 "one_way": one_way,
-                "last_tool_args": state.get("last_tool_args") or {},
+                "last_tool_args": merged_last_args,
+                "user_followup_hint": user_followup_hint,
+                "execution_plan": {**execution_plan, "tasks": []},
             }
 
-        # ==============================
-        # Phase 3: 串行执行工具
-        # ==============================
-        print(f"→ Phase 3: Executing {len(tasks_and_names)} tools sequentially (rate-limit safe)")
-
+        # 串行执行工具
+        print(f"→ Phase: Executing {len(tasks_and_names)} tools sequentially (rate-limit safe)")
         processed_messages: List[ToolMessage] = []
 
         def _tool_error_placeholder(tool_name: str, err: Exception) -> str:
@@ -605,7 +611,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
         for i, (task_coro, tool_name, tool_args) in enumerate(tasks_and_names):
             print(f"→ [{i+1}/{len(tasks_and_names)}] Running tool: {tool_name}")
 
-            key_kwargs = dict((state.get("last_tool_args") or {}).get(tool_name, {}) or {})
+            key_kwargs = dict((merged_last_args or {}).get(tool_name, {}) or {})
             if tool_name == "search_flights":
                 key_kwargs["one_way"] = one_way
 
@@ -642,7 +648,9 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             "form_to_display": None,
             "tools_used": reuse_tools,
             "one_way": one_way,
-            "last_tool_args": state.get("last_tool_args") or {},
+            "last_tool_args": merged_last_args,
+            "user_followup_hint": user_followup_hint,
+            "execution_plan": execution_plan,
         }
 
     except (ValueError, ValidationError) as e:
@@ -653,6 +661,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             "form_to_display": None,
             "one_way": one_way,
             "last_tool_args": state.get("last_tool_args") or {},
+            "execution_plan": state.get("execution_plan"),
         }
 
     except Exception as e:
@@ -663,6 +672,7 @@ async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
             "form_to_display": None,
             "one_way": one_way,
             "last_tool_args": state.get("last_tool_args") or {},
+            "execution_plan": state.get("execution_plan"),
         }
 
 
@@ -687,43 +697,30 @@ def _parse_budget_to_float(raw: object) -> Optional[float]:
 
 
 def _ensure_budget_for_packages(travel_plan: TravelPlan, customer_info: dict) -> Optional[float]:
-    # 优先使用用户话里解析到的预算
     if travel_plan.total_budget is not None and travel_plan.total_budget > 0:
         return travel_plan.total_budget
 
-    # 兜底使用表单预算
     fallback = _parse_budget_to_float(customer_info.get("budget"))
     if fallback is not None and fallback > 0:
-        travel_plan.total_budget = fallback  # ✅ 只为生成套餐写回
+        travel_plan.total_budget = fallback
         return fallback
 
     return None
 
 
 # ------------------------------------------------------------------------------
-# Synthesis node（可替换版本：不依赖 last_tool_args 也能稳定复用）
+# Synthesis node（保持你给的版本）
 # ------------------------------------------------------------------------------
 
 async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
     """
-    综合节点（Synthesis Agent）：
-    1. 把工具 ToolMessage 的 JSON 解析成 Flight/Hotel/Activity 对象
-    2.（如果有预算 && 有机票 && 有酒店）调用套餐生成器
-    3. 调用 LLM 生成最终用户话术
-    4. 把结果同步到 CRM + 给用户发邮件
-
-    额外处理：
-    - 识别 is_error / error_message，API 挂掉时优雅降级，不编造数据。
-    - ✅ key 匹配不到时，不直接误报 supplier outage；先做“安全兜底”。
+    你的原版本（我未改动逻辑，只确保依赖的 helper 在本文件上半部分都存在）
     """
     print("━━━ NODE: Synthesis & Response ━━━")
 
     travel_plan = state.get("travel_plan")
     customer_info = state.get("customer_info") or {}
 
-    # ------------------------------------------------------------------
-    # 1) 白名单过滤（保持你原有逻辑）
-    # ------------------------------------------------------------------
     tools_used = state.get("tools_used", [])
     if tools_used:
         allowed_tools = set(tools_used)
@@ -738,18 +735,12 @@ async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
 
     one_way = state.get("one_way", False)
 
-    # ------------------------------------------------------------------
-    # 2) 计算当前 key（✅ 不依赖 last_tool_args，直接用 travel_plan 语义字段）
-    # ------------------------------------------------------------------
     current_keys: Dict[str, str] = {}
     if travel_plan:
         for tool_name in ["search_flights", "search_and_compare_hotels", "search_activities_by_city"]:
             key_kwargs = _semantic_key_kwargs_for_tool(travel_plan, tool_name, one_way)
             current_keys[tool_name] = _compute_tool_key(tool_name, travel_plan, **key_kwargs)
 
-    # ------------------------------------------------------------------
-    # 3) 倒序扫描 ToolMessage：每个工具只取 key 匹配的那条
-    # ------------------------------------------------------------------
     tool_results: Dict[str, str] = {}
     pending = set(allowed_tools)
 
@@ -766,18 +757,12 @@ async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
 
     print("🔍 allowed_tools:", allowed_tools)
     print("🔍 current_keys:", {k: current_keys.get(k) for k in allowed_tools})
-    print("📦 stored_keys  :", [
-        getattr(m, "tool_call_id", None) for m in messages if isinstance(m, ToolMessage)
-    ])
+    print("📦 stored_keys  :", [getattr(m, "tool_call_id", None) for m in messages if isinstance(m, ToolMessage)])
     print("✅ matched tools:", list(tool_results.keys()))
     print("🧪 pending left:", pending)
 
-    # ------------------------------------------------------------------
-    # 3.1) 安全兜底：如果 key 匹配不到，但最近 ToolMessage 是“全 error placeholder”，允许拿来降级
-    # ------------------------------------------------------------------
     if pending:
         for tool_name in list(pending):
-            # 找最近的同名 ToolMessage
             for msg in reversed(messages):
                 if isinstance(msg, ToolMessage) and msg.name == tool_name:
                     if _tool_content_is_all_error_placeholders(msg.content):
@@ -785,18 +770,12 @@ async def synthesize_results_node(state: TravelAgentState) -> Dict[str, Any]:
                         pending.remove(tool_name)
                     break
 
-    # ------------------------------------------------------------------
-    # 3.2) 如果仍然一个都匹配不到：
-    #     - 如果历史里根本没有相关 ToolMessage：说明工具没跑/系统不可用
-    #     - 如果有但匹配不到：更像内部 key/状态不一致（不要误报 supplier outage）
-    # ------------------------------------------------------------------
     if not tool_results and allowed_tools:
         has_any_relevant_toolmsg = any(
             isinstance(m, ToolMessage) and m.name in allowed_tools for m in messages
         )
 
         if not has_any_relevant_toolmsg:
-            # 工具根本没跑
             synthesis_prompt = """You are an AI travel assistant. You MUST respond in **English**.
 
 IMPORTANT:
@@ -810,7 +789,6 @@ YOUR TASK:
 - Keep the tone reassuring and practical.
 """
         else:
-            # 有 ToolMessage 但 key 匹配失败：内部一致性问题
             synthesis_prompt = """You are an AI travel assistant. You MUST respond in **English**.
 
 IMPORTANT:
@@ -852,9 +830,6 @@ YOUR TASK:
             "form_to_display": None,
         }
 
-    # ------------------------------------------------------------------
-    # 4) 解析工具返回为结构化 options
-    # ------------------------------------------------------------------
     all_options: Dict[str, list] = {"flights": [], "hotels": [], "activities": []}
 
     intent = travel_plan.user_intent if travel_plan else "full_plan"
@@ -881,9 +856,6 @@ YOUR TASK:
         except (json.JSONDecodeError, TypeError, ValueError) as e:
             print(f"✗ Failed to parse {tool_name}: {e}")
 
-    # ------------------------------------------------------------------
-    # 5) 错误占位过滤：flights / activities / hotels
-    # ------------------------------------------------------------------
     flights_all: List[FlightOption] = all_options.get("flights", [])
     normal_flights: List[FlightOption] = []
     flight_error_message: Optional[str] = None
@@ -923,9 +895,6 @@ YOUR TASK:
     if hotel_error_message:
         state["hotel_error_message"] = hotel_error_message
 
-    # ------------------------------------------------------------------
-    # 6) 尝试生成套餐（仅在真实有机票 + 酒店时）
-    # ------------------------------------------------------------------
     packages: List[TravelPackage] = []
     if (
         travel_plan
@@ -947,9 +916,6 @@ YOUR TASK:
     synthesis_prompt = ""
     hubspot_recommendations: Dict[str, Any] = {}
 
-    # ------------------------------------------------------------------
-    # 7) 生成最终话术（以下分支逻辑保持你原来的）
-    # ------------------------------------------------------------------
     if packages:
         has_balanced = any(getattr(p, "grade", None) == "Balanced" for p in packages)
         if has_balanced:
@@ -1191,21 +1157,14 @@ Offer specific ways to adjust:
 """
                 hubspot_recommendations = {"error": "No results found"}
 
-    # ------------------------------------------------------------------
-    # 调用 LLM 生成最终回复
-    # ------------------------------------------------------------------
     try:
         final_response = await llm.ainvoke(synthesis_prompt)
     except Exception as e:
         print(f"✗ Response generation failed: {e}")
         final_response = AIMessage(
-            content=(
-                "I apologize, but I encountered an issue generating your "
-                "recommendations. Please try again."
-            ),
+            content="I apologize, but I encountered an issue generating your recommendations. Please try again."
         )
 
-    # 邮件通知
     to_email = customer_info.get("email")
     if to_email:
         try:
@@ -1223,6 +1182,3 @@ Offer specific ways to adjust:
         "current_step": "complete",
         "form_to_display": None,
     }
-
-
-
