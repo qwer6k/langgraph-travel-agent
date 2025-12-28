@@ -1,6 +1,12 @@
-"""
-FastAPI Server - Multi-Agent Travel Booking System
-Production-ready async server with background task processing.
+"""FastAPI Server - Multi-Agent Travel Booking System.
+
+This server uses LangGraph with async background task processing.
+
+2025-12: Migrated customer_info HITL to LangGraph native interrupt/resume.
+- First /chat may return an interrupt (customer form request)
+- Frontend submits to /chat/resume (or /chat/customer-info alias), which resumes
+    execution via Command(resume=...).
+- State is persisted to SQLite via SqliteSaver.
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -10,8 +16,13 @@ from typing import Optional
 import uvicorn
 from langchain_core.messages import HumanMessage
 import uuid
-from backend.travel_agent import build_enhanced_graph 
-import asyncio
+from pathlib import Path
+import os
+
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.types import Command
+
+from backend.travel_agent import build_enhanced_graph
 
 # ============================================================================
 # APPLICATION INITIALIZATION
@@ -23,16 +34,25 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Initialize agent graph
-agent_graph = build_enhanced_graph()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# SQLite checkpoint DB (simple external persistence)
+LANGGRAPH_SQLITE_PATH = os.getenv(
+    "LANGGRAPH_SQLITE_PATH",
+    str(PROJECT_ROOT / ".langgraph_checkpoints.sqlite"),
+)
 
 # In-memory job store for async task tracking
 # PRODUCTION: Replace with Redis for scalability
 jobs = {}
+# Track threads that are currently waiting for a resume (HITL)
+# Maps thread_id -> task_id (the task that produced the interrupt)
+waiting_for_resume: dict[str, str] = {}
 
-# In-memory customer data storage
-# PRODUCTION: Replace with database or Redis
-customer_data = {}
+def _ensure_sqlite_parent_dir() -> None:
+    db_path = Path(LANGGRAPH_SQLITE_PATH)
+    if db_path.parent and str(db_path.parent) not in (".", ""):
+        db_path.parent.mkdir(parents=True, exist_ok=True)
 
 # ============================================================================
 # CORS CONFIGURATION
@@ -75,6 +95,13 @@ class StatusResponse(BaseModel):
     result: dict | None = None
     form_to_display: str | None = None
 
+
+class ResumeRequest(BaseModel):
+    """Resume a paused LangGraph execution via Command(resume=...)."""
+
+    thread_id: str = Field(min_length=5)
+    resume: dict
+
 class CustomerInfoRequest(BaseModel):
     """Customer information submission"""
     thread_id: str = Field(min_length=5)
@@ -93,53 +120,59 @@ async def run_agent_in_background(
     print(f"→ Background task {task_id} started (continuation: {is_continuation})")
 
     try:
-        # ✅ checkpoint key 永远稳定：只用 thread_id
-        graph_thread_id = thread_id
-        config = {"configurable": {"thread_id": graph_thread_id}}
+        config = {"configurable": {"thread_id": thread_id}}
 
-        # ✅ 只传本轮用户消息 + is_continuation +（可选）customer_info
-        #    不要传 current_step，避免覆盖 checkpoint 内状态
+        _ensure_sqlite_parent_dir()
+
         initial_state = {
             "messages": [HumanMessage(content=message)],
             "is_continuation": is_continuation,
         }
 
-        if thread_id in customer_data:
-            initial_state["customer_info"] = customer_data[thread_id]
-            print(f"→ Using stored customer info for thread {thread_id}")
-
-        # 调 LangGraph
-        final_state = await agent_graph.ainvoke(initial_state, config)
+        # Compile + invoke with SQLite checkpointer
+        async with AsyncSqliteSaver.from_conn_string(LANGGRAPH_SQLITE_PATH) as saver:
+            graph = build_enhanced_graph(checkpointer=saver)
+            final_state = await graph.ainvoke(initial_state, config)
 
         # ============================================================
         # 计算 reply
         # ============================================================
+        # If graph interrupted (HITL), return a stable prompt + form trigger
+        if isinstance(final_state, dict) and final_state.get("__interrupt__"):
+            # mark this thread as waiting for resume so backend can enforce resume-only flow
+            try:
+                waiting_for_resume[thread_id] = task_id
+            except Exception:
+                pass
+
+            jobs[task_id] = {
+                "status": "completed",
+                "result": {
+                    "reply": (
+                        "✅ I have noted your travel needs.\n\n"
+                        "Please fill in your contact information below (name, email, budget, etc.). "
+                        "After that, I will immediately continue from where we paused."
+                    )
+                },
+                "form_to_display": "customer_info",
+            }
+            print(f"✓ Background task {task_id} interrupted (customer_info)")
+            return
+
         reply: str | None = None
-        msgs = final_state.get("messages", []) or []
+        msgs = (final_state.get("messages", []) if isinstance(final_state, dict) else []) or []
 
         # 是否已经有“非 HumanMessage”的回复（ToolMessage / AIMessage）
         has_non_human = any(not isinstance(m, HumanMessage) for m in msgs)
 
-        # ✅ collecting_info 的提示：只依赖 final_state（更稳，不依赖 is_continuation）
-        if (
-            final_state.get("form_to_display") == "customer_info"
-            and final_state.get("current_step") == "collecting_info"
-            and not has_non_human
-        ):
-            reply = (
-                "✅ I have noted your travel needs.\n\n"
-                "Please fill in your contact information below (name, email, budget, etc.). "
-                "After that, I will immediately search for suitable flights, hotels, and activities."
-            )
-        else:
-            # 从最后往前找一条“非 HumanMessage”的消息作为回复
-            for msg in reversed(msgs):
-                if isinstance(msg, HumanMessage):
-                    continue
-                content = getattr(msg, "content", None)
-                if content:
-                    reply = str(content)
-                    break
+        # 从最后往前找一条“非 HumanMessage”的消息作为回复
+        for msg in reversed(msgs):
+            if isinstance(msg, HumanMessage):
+                continue
+            content = getattr(msg, "content", None)
+            if content:
+                reply = str(content)
+                break
 
         if reply is None:
             reply = "I've processed the information."
@@ -149,8 +182,8 @@ async def run_agent_in_background(
             "result": {"reply": reply},
         }
 
-        # 仍然把 form_to_display 返回给前端，维持交互逻辑
-        if final_state.get("form_to_display"):
+        # Backward-compatible: allow agents to signal a form trigger
+        if isinstance(final_state, dict) and final_state.get("form_to_display"):
             result_data["form_to_display"] = final_state["form_to_display"]
 
         jobs[task_id] = result_data
@@ -165,6 +198,56 @@ async def run_agent_in_background(
             "result": {"error": str(e)},
         }
         print(f"✗ Background task {task_id} failed: {e}")
+
+
+async def run_resume_in_background(task_id: str, thread_id: str, resume: dict):
+    print(f"→ Resume task {task_id} started")
+    try:
+        # clear waiting flag as we're about to consume the resume for this thread
+        try:
+            waiting_for_resume.pop(thread_id, None)
+        except Exception:
+            pass
+        config = {"configurable": {"thread_id": thread_id}}
+
+        _ensure_sqlite_parent_dir()
+
+        async with AsyncSqliteSaver.from_conn_string(LANGGRAPH_SQLITE_PATH) as saver:
+            graph = build_enhanced_graph(checkpointer=saver)
+            final_state = await graph.ainvoke(Command(resume=resume), config)
+
+        # If still interrupted, keep asking (rare but possible)
+        if isinstance(final_state, dict) and final_state.get("__interrupt__"):
+            jobs[task_id] = {
+                "status": "completed",
+                "result": {
+                    "reply": "Still need more information. Please complete the form.",
+                },
+                "form_to_display": "customer_info",
+            }
+            print(f"✓ Resume task {task_id} interrupted again")
+            return
+
+        reply: str | None = None
+        msgs = (final_state.get("messages", []) if isinstance(final_state, dict) else []) or []
+        for msg in reversed(msgs):
+            if isinstance(msg, HumanMessage):
+                continue
+            content = getattr(msg, "content", None)
+            if content:
+                reply = str(content)
+                break
+        if reply is None:
+            reply = "I've processed the information."
+
+        jobs[task_id] = {"status": "completed", "result": {"reply": reply}}
+        print(f"✓ Resume task {task_id} completed")
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        jobs[task_id] = {"status": "failed", "result": {"error": str(e)}}
+        print(f"✗ Resume task {task_id} failed: {e}")
 
 
 # ============================================================================
@@ -200,16 +283,36 @@ async def start_chat_task(request: ChatRequest, background_tasks: BackgroundTask
     3. Extract result from status response
     """
     task_id = str(uuid.uuid4())
-    jobs[task_id] = {"status": "running"}
-    
+
+    # include metadata for better traceability and cleanup
+    jobs[task_id] = {"status": "running", "thread_id": request.thread_id, "is_continuation": bool(request.is_continuation)}
+    # If this thread currently awaits a resume (HITL), block non-resume starts
+    if waiting_for_resume.get(request.thread_id):
+        # Client should call /chat/resume to continue the interrupted flow
+        raise HTTPException(status_code=409, detail="This thread is waiting for a form response. Please submit via /chat/resume or /chat/customer-info to resume the interrupted session.")
+
+    # If the client explicitly requests a fresh start (is_continuation=False),
+    # delete any previous checkpoint for this thread so the graph starts clean.
+    if not request.is_continuation:
+        _ensure_sqlite_parent_dir()
+        async def _delete_checkpoint():
+            try:
+                async with AsyncSqliteSaver.from_conn_string(LANGGRAPH_SQLITE_PATH) as saver:
+                    await saver.adelete_thread(request.thread_id)
+            except Exception as e:
+                # If the DB is empty or schema not yet created, ignore deletion errors
+                print(f"⚠ Could not delete checkpoint for thread {request.thread_id}: {e}")
+        # Execute deletion immediately (await here to ensure deletion before background run)
+        await _delete_checkpoint()
+
     background_tasks.add_task(
         run_agent_in_background,
         task_id,
         request.thread_id,
         request.message,
-        request.is_continuation
+        request.is_continuation,
     )
-    
+
     print(f"→ Chat task created: {task_id}")
     return TaskResponse(task_id=task_id)
 
@@ -228,8 +331,8 @@ async def get_task_status(task_id: str):
         raise HTTPException(status_code=404, detail="Task not found")
     return StatusResponse(**job)
 
-@app.post("/chat/customer-info", tags=["AI Agent"])
-async def submit_customer_info(request: CustomerInfoRequest):
+@app.post("/chat/customer-info", response_model=TaskResponse, tags=["AI Agent"])
+async def submit_customer_info(request: CustomerInfoRequest, background_tasks: BackgroundTasks):
     """
     Submit customer information for a conversation thread.
     
@@ -238,13 +341,31 @@ async def submit_customer_info(request: CustomerInfoRequest):
     
     The information is stored and injected into subsequent agent calls.
     """
-    customer_data[request.thread_id] = request.customer_info
-    print(f"→ Customer info stored for thread {request.thread_id}")
-    
-    return {
-        "status": "received",
-        "message": "Customer information saved successfully"
-    }
+    # Backward-compatible alias: resume the interrupted graph.
+    task_id = str(uuid.uuid4())
+    # clear waiting flag before enqueueing resume
+    waiting_for_resume.pop(request.thread_id, None)
+    jobs[task_id] = {"status": "running", "thread_id": request.thread_id, "is_continuation": True}
+    print(f"→ Customer info received for thread {request.thread_id}, resume task: {task_id}")
+
+    background_tasks.add_task(run_resume_in_background, task_id, request.thread_id, request.customer_info)
+
+    return TaskResponse(task_id=task_id)
+
+
+@app.post("/chat/resume", response_model=TaskResponse, tags=["AI Agent"])
+async def resume_chat(request: ResumeRequest, background_tasks: BackgroundTasks):
+    """Resume a paused execution.
+
+    Frontend should call this after it receives a customer_info form trigger.
+    """
+    task_id = str(uuid.uuid4())
+    # clear waiting flag before enqueueing resume
+    waiting_for_resume.pop(request.thread_id, None)
+    jobs[task_id] = {"status": "running", "thread_id": request.thread_id, "is_continuation": True}
+    background_tasks.add_task(run_resume_in_background, task_id, request.thread_id, request.resume)
+    print(f"→ Resume task created: {task_id}")
+    return TaskResponse(task_id=task_id)
 
 @app.delete("/chat/thread/{thread_id}", tags=["AI Agent"])
 async def clear_thread(thread_id: str):
@@ -252,12 +373,23 @@ async def clear_thread(thread_id: str):
     Clear stored data for a conversation thread.
     同时重建 agent_graph，把 InMemorySaver 里的所有 checkpoint 一起清掉。
     """
-    # 1. 清业务数据
-    customer_data.pop(thread_id, None)
+    # 1) clear checkpoints for this thread
+    _ensure_sqlite_parent_dir()
+    async with AsyncSqliteSaver.from_conn_string(LANGGRAPH_SQLITE_PATH) as saver:
+        await saver.adelete_thread(thread_id)
 
-    # 2. 重建图 = 清掉所有 thread 的 checkpoint（单用户最粗暴有效）
-    global agent_graph
-    agent_graph = build_enhanced_graph()
+    # 2) clear in-memory job statuses (optional)
+    for k, v in list(jobs.items()):
+        try:
+            if isinstance(v, dict) and v.get("thread_id") == thread_id:
+                jobs.pop(k, None)
+        except Exception:
+            pass
+
+    # clear waiting flag if any
+    waiting_for_resume.pop(thread_id, None)
+
+    return {"status": "cleared", "thread_id": thread_id}
 
     print(f"→ Thread {thread_id} customer data cleared & graph rebuilt (all checkpoints dropped)")
     return {"status": "cleared"}

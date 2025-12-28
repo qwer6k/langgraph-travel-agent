@@ -64,6 +64,17 @@ def _submit_customer_info(thread_id: str, customer_info: Dict[str, Any]) -> None
         resp.raise_for_status()
 
 
+def _resume(thread_id: str, resume: Dict[str, Any]) -> Dict[str, Any]:
+    with httpx.Client(base_url=BACKEND_URL, timeout=60.0) as client:
+        resp = client.post(
+            "/chat/resume",
+            json={"thread_id": thread_id, "resume": resume},
+        )
+        resp.raise_for_status()
+        task_id = resp.json()["task_id"]
+        return _poll_task(client, task_id)
+
+
 def _clear_thread(thread_id: str) -> None:
     with httpx.Client(base_url=BACKEND_URL, timeout=30.0) as client:
         resp = client.delete(f"/chat/thread/{thread_id}")
@@ -129,8 +140,7 @@ def on_submit_customer_info(
     customer_info = {"name": name, "email": email, "phone": phone, "budget": budget}
 
     try:
-        _submit_customer_info(thread_id, customer_info)
-        payload = _chat_once(pending_user_message, thread_id, is_continuation=True)
+        payload = _resume(thread_id, customer_info)
     except Exception as e:
         history = history + [("", f"提交/续聊失败：{e}")]
         return history, thread_id, pending_user_message, True, gr.update(visible=True)
@@ -144,12 +154,8 @@ def on_submit_customer_info(
 
     reply = (result.get("reply") or "").strip() or "（无回复）"
 
-    # 尽量不重复展示用户消息：直接覆盖最后一条 bot 回复
-    if history and history[-1][0] == pending_user_message:
-        history[-1] = (pending_user_message, reply)
-    else:
-        history = history + [(pending_user_message, reply)]
-
+    # 由于 resume 不需要重发用户消息，这里用空 user 字段展示 bot 回复
+    history = history + [("", reply)]
     return history, thread_id, "", False, gr.update(visible=False)
 
 

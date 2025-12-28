@@ -17,6 +17,7 @@ langchain-google-genai>=2.0.0
 amadeus>=8.1.0           # Amadeus travel API
 twilio>=9.0.0           # SMS notifications (optional)
 httpx>=0.27.0           # Async HTTP client for API calls
+aiosqlite>=0.20.0       # Required for AsyncSqliteSaver (SQLite checkpointing)
 
 # ----------------------------------------------------------------------------
 # Data Validation & Parsing

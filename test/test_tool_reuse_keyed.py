@@ -227,7 +227,7 @@ async def test_pick_hotels_by_key__date_change(m):
     planB = _make_plan(m, destination="PAR", departure_date="2026-02-15", return_date="2026-02-18",
                        user_intent="hotels_only")
 
-    # 建议按你 call_model_node 创建 ToolMessage 的方式算 key（带 kwargs）
+    # 建议按你创建 ToolMessage 的方式算 key（带 kwargs）
     keyA = m._compute_tool_key(
         "search_and_compare_hotels",
         planA,
@@ -262,7 +262,7 @@ async def test_pick_hotels_by_key__date_change(m):
 
 # ============================================================
 # 3) 预算变化：不 rerun 工具，但仍能复用同 key 的历史结果
-#    （这里会用到 call_model_node 的 diff gating）
+#    （这里会用到 diff gating）
 # ============================================================
 
 @pytest.mark.asyncio
@@ -301,13 +301,16 @@ async def test_budget_change_reuse_history_no_tool_rerun(m, monkeypatch):
         ],
     }
 
-    res = await m.call_model_node(state)
+    # 新版多节点：parse/update plan -> execute tools（此用例只验证 gating，不跑工具）
+    u1 = await m.parse_or_update_plan_node(state)
+    state2 = {**state, **u1}
+    res = await m.execute_tools_node(state2)
 
     # 预期：只改预算 => 不跑工具，进入 synthesizing
     assert res["current_step"] == "synthesizing"
     assert res.get("messages") == []  # 没有新 ToolMessage
 
-    # 把 call_model_node 的输出写回 state（模拟 graph 行为）
+    # 把节点输出写回 state（模拟 graph 行为）
     state["travel_plan"] = res["travel_plan"]
     state["tools_used"] = res.get("tools_used", ["search_flights"])
     state["one_way"] = state.get("one_way", False)

@@ -146,11 +146,14 @@ class TravelAgentState(TypedDict):
     # 你现在代码里会读写这个（用于 tool key 复用）
     last_tool_args: Optional[Dict[str, Dict[str, Any]]]
 
-    # 你 PR2 在 call_model_node 里写入了 execution_plan（目前是 dict，也允许未来换成 model_dump）
+    # agent 节点会写入 execution_plan（目前是 dict，也允许未来换成 model_dump）
     execution_plan: Optional[Dict[str, Any]]
 
     # 你现在用于 refresh 的 hint（synthesis 可选用）
     user_followup_hint: Optional[str]
+
+    # internal: snapshot of previous plan (used for diff/rerun decisions)
+    _prev_travel_plan: Optional[TravelPlan]
 
     # ---- synthesize_results_node() 写入的字段（你原来就有） ----
     flight_error_message: Optional[str]

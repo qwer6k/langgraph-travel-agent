@@ -96,15 +96,32 @@ cp .env.example .env
 
 **Option 2: Python API (for developers)**
 ```python
-from agent_graph import build_enhanced_graph
+import asyncio
 from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from backend.travel_agent import build_enhanced_graph
 
-graph = build_enhanced_graph()
-response = await graph.ainvoke({
-    'messages': [HumanMessage(content="Find flights to Tokyo")]
-})
-print(response['messages'][-1].content)
+async def main():
+    async with AsyncSqliteSaver.from_conn_string(".langgraph_checkpoints.sqlite") as saver:
+        graph = build_enhanced_graph(checkpointer=saver)
+        config = {"configurable": {"thread_id": "python-demo"}}
+        response = await graph.ainvoke({
+            "messages": [HumanMessage(content="Find flights to Tokyo")]
+        }, config=config)
+        print(response["messages"][-1].content)
+
+asyncio.run(main())
+``` 
+
+### LangGraph 原生 HITL（interrupt/resume）PoC
+
+如果你想对比“当前仓库的表单轮询式 HITL”与 langgraph 原生暂停/恢复机制，见示例：
+
+```bash
+python examples/langgraph_hitl_poc.py --demo
 ```
+
+交互模式与更多说明见 [examples/README.md](examples/README.md)。
 
 ---
 
@@ -302,42 +319,46 @@ HUBSPOT_API_KEY=your_key_here
 ### Example 1: Full Trip Planning
 
 ```python
-from agent_graph import build_enhanced_graph
+import asyncio
 from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from backend.travel_agent import build_enhanced_graph
 
-graph = build_enhanced_graph()
+async def run_full_trip_example():
+    async with AsyncSqliteSaver.from_conn_string(".langgraph_checkpoints.sqlite") as saver:
+        graph = build_enhanced_graph(checkpointer=saver)
+        config = {"configurable": {"thread_id": "full-trip-demo"}}
 
-# User provides complete trip details
-response = await graph.ainvoke({
-    'messages': [HumanMessage(
-        content="Plan a 7-day honeymoon to Bali from NYC, "
-                "departing May 15, budget $5000"
-    )],
-    'customer_info': {
-        'name': 'John Doe',
-        'email': 'john@example.com',
-        'phone': '+1234567890',
-        'budget': '5000'
-    }
-})
+        response = await graph.ainvoke({
+            "messages": [HumanMessage(
+                content="Plan a 7-day honeymoon to Bali from NYC, departing May 15, budget $5000"
+            )],
+            "customer_info": {
+                "name": "John Doe",
+                "email": "john@example.com",
+                "phone": "+1234567890",
+                "budget": "5000"
+            }
+        }, config=config)
 
-# System returns 3 packages: Budget, Balanced, Premium
-packages = response['messages'][-1].content
+        # System returns 3 packages: Budget, Balanced, Premium
+        packages = response["messages"][-1].content
+        print(packages)
 
+asyncio.run(run_full_trip_example())
 ```
 
 ### Example 2: Flight-Only Search
 
 ```python
+# Reuse the same `graph` instance and `config` from Example 1.
 response = await graph.ainvoke({
     'messages': [HumanMessage(
-        content="Find business class flights from Seoul to Paris "
-                "on June 10, returning June 20"
+        content="Find business class flights from Seoul to Paris on June 10, returning June 20"
     )]
-})
+}, config=config)
 
 # Returns top 3 flight options sorted by relevance
-
 ```
 
 ### Example 3: Hotel Search
@@ -345,13 +366,11 @@ response = await graph.ainvoke({
 ```python
 response = await graph.ainvoke({
     'messages': [HumanMessage(
-        content="4-star hotels in Tokyo for 3 nights, "
-                "checking in July 1"
+        content="4-star hotels in Tokyo for 3 nights, checking in July 1"
     )]
-})
+}, config=config)
 
 # Returns combined results from Amadeus + Hotelbeds
-
 ```
 
 ### Example 4: Activity Search
@@ -361,7 +380,7 @@ response = await graph.ainvoke({
     'messages': [HumanMessage(
         content="What are the top activities in Rome?"
     )]
-})
+}, config=config)
 
 # Returns activities with pricing near city center
 
@@ -370,23 +389,27 @@ response = await graph.ainvoke({
 ### Example 5: Conversation Persistence
 
 ```python
-from langgraph.checkpoint.memory import InMemorySaver
+import asyncio
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from backend.travel_agent import build_enhanced_graph
+from langchain_core.messages import HumanMessage
 
-checkpointer = InMemorySaver()
-graph = build_enhanced_graph(checkpointer)
+async def persistence_demo():
+    async with AsyncSqliteSaver.from_conn_string(".langgraph_checkpoints.sqlite") as saver:
+        graph = build_enhanced_graph(checkpointer=saver)
+        config = {"configurable": {"thread_id": "user_123"}}
 
-config = {"configurable": {"thread_id": "user_123"}}
+        response1 = await graph.ainvoke({
+            'messages': [HumanMessage(content="I want to visit Japan")]
+        }, config)
 
-# First message
-response1 = await graph.ainvoke({
-    'messages': [HumanMessage(content="I want to visit Japan")]
-}, config)
+        response2 = await graph.ainvoke({
+            'messages': [HumanMessage(content="For 10 days with $3000 budget")]
+        }, config)
 
-# Follow-up message (maintains context)
-response2 = await graph.ainvoke({
-    'messages': [HumanMessage(content="For 10 days with $3000 budget")]
-}, config)
+        print(response2["messages"][-1].content)
 
+asyncio.run(persistence_demo())
 ```
 
 
@@ -422,18 +445,30 @@ tools = [
 
 ```python
 # simple_server.py
+import asyncio
 from fastapi import FastAPI
-from agent_graph import build_enhanced_graph
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain_core.messages import HumanMessage
+from backend.travel_agent import build_enhanced_graph
 
 app = FastAPI()
-graph = build_enhanced_graph()
+
+@app.on_event("startup")
+async def startup_event():
+    app.state.checkpointer = await AsyncSqliteSaver.from_conn_string(".langgraph_checkpoints.sqlite").__aenter__()
+    app.state.graph = build_enhanced_graph(checkpointer=app.state.checkpointer)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    saver = getattr(app.state, "checkpointer", None)
+    if saver:
+        await saver.__aexit__(None, None, None)
 
 @app.post("/chat")
 async def chat(message: str):
-    response = await graph.ainvoke({
+    response = await app.state.graph.ainvoke({
         'messages': [HumanMessage(content=message)]
-    })
+    }, config={"configurable": {"thread_id": "fastapi-demo"}})
     return {"response": response['messages'][-1].content}
 
 # Run: uvicorn simple_server:app --reload

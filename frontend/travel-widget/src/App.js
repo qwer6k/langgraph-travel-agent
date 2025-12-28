@@ -159,38 +159,35 @@ How can I help you get started?
       }
   };
     
-    // [NEW] form submit handler
+    // form submit handler (LangGraph interrupt/resume)
     const handleFormSubmit = async (customerInfo) => {
       setShowCustomerForm(false);
       setUserInfo(customerInfo);
       
       try {
-          const baseUrl = process.env.REACT_APP_API_URL || 'http://localhost:8008';
-          await axios.post(`${baseUrl}/chat/customer-info`, {
-              thread_id: threadId,
-              customer_info: customerInfo
-          });
-          
-          setMessages(prev => [...prev, 
-              { type: 'bot', text: "✅ Information saved! Now searching for the best options..." },
-              { type: 'bot', text: 'Finding flights, hotels, and activities...', isLoading: true }
-          ]);
-          setIsLoading(true);
-          
-          const response = await axios.post(`${baseUrl}/chat`, { 
-              message: messages[1].text,
-              thread_id: threadId,
-              is_continuation: true
-          });
-          
-          if (response.data.task_id) {
-              pollForResult(response.data.task_id);
-          }
-          
+        const baseUrl = process.env.REACT_APP_API_URL || 'http://localhost:8008';
+
+        setMessages(prev => [...prev, 
+          { type: 'bot', text: "✅ Information saved! Now continuing from where we paused..." },
+          { type: 'bot', text: 'Finding flights, hotels, and activities...', isLoading: true }
+        ]);
+        setIsLoading(true);
+
+        const response = await axios.post(`${baseUrl}/chat/resume`, {
+          thread_id: threadId,
+          resume: customerInfo
+        });
+
+        if (response.data.task_id) {
+          pollForResult(response.data.task_id);
+        } else {
+          throw new Error("Failed to start the resume task.");
+        }
+
       } catch (error) {
-          console.error('Customer info submission error:', error);
-          setMessages(prev => [...prev, { type: 'bot', text: "Error occurred during saving." }]);
-          setIsLoading(false);
+        console.error('Customer info submission error:', error);
+        setMessages(prev => [...prev, { type: 'bot', text: "Error occurred during saving." }]);
+        setIsLoading(false);
       }
     };
 

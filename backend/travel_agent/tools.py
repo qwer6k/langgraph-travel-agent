@@ -60,12 +60,15 @@ def _hotel_error_placeholder(source: str, message: str) -> List[HotelOption]:
 
 
 def _safe_price_to_float(price: str) -> float | None:
+    from .currency import parse_price_to_usd
     if not price:
         return None
-    first = price.split()[0]
+    usd = parse_price_to_usd(price)
+    if usd is None:
+        return None
     try:
-        return float(first)
-    except ValueError:
+        return float(usd)
+    except Exception:
         return None
 
 
@@ -1052,6 +1055,10 @@ async def search_activities_by_city(city_name: str) -> List[ActivityOption]:
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import hashlib
+
+# In-memory sent-email idempotency log (process-wide). Keys are hashes of to|subject|body.
+SENT_EMAILS: set[str] = set()
 
 
 class EmailArgs(BaseModel):
@@ -1067,8 +1074,17 @@ def send_email_notification(to_email: str, subject: str, body: str) -> str:
 
     Uses port 587 + STARTTLS because 465 is blocked in the current environment.
     """
+    # idempotency key: deterministic based on recipient, subject and body
+    key_src = f"{to_email}|{subject}|{body}"
+    key = hashlib.sha256(key_src.encode("utf-8")).hexdigest()
+    if key in SENT_EMAILS:
+        print(f"→ Email skipped (idempotent): TO={to_email}, SUB={subject}")
+        return "Skipped duplicate email (idempotent)."
+
     if not EMAIL_SENDER or not EMAIL_PASSWORD:
         print(f"→ Email (Mock): TO={to_email}, SUB={subject}")
+        # mark as sent in mock mode to enforce idempotency in same process
+        SENT_EMAILS.add(key)
         return "Email configuration missing. Sent mock email to console."
 
     try:
@@ -1087,6 +1103,8 @@ def send_email_notification(to_email: str, subject: str, body: str) -> str:
             server.send_message(msg)
 
         print(f"✓ Email sent to {to_email}")
+        # record successful send for idempotency
+        SENT_EMAILS.add(key)
         return "Email notification sent successfully."
 
     except Exception as e:

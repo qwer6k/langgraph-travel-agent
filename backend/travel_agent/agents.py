@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional, Awaitable, Tuple
 
 from pydantic import ValidationError
 from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.types import interrupt
 
 from .config import llm
 from .schemas import (
@@ -112,7 +113,10 @@ def _compute_rerun_flags(prev: Optional[TravelPlan], new: TravelPlan) -> tuple[b
         "adults", "travel_class", "departure_time_pref", "arrival_time_pref", "user_intent",
     }
     hotels_deps = {"destination", "departure_date", "return_date", "adults", "user_intent"}
-    activities_deps = {"destination", "user_intent"}
+    # Activities can depend on travel dates too (events/tickets availability),
+    # so include departure/return date in the dependency set to conservatively
+    # trigger reruns when dates change.
+    activities_deps = {"destination", "user_intent", "departure_date", "return_date"}
 
     rerun_flights = bool(changed & flights_deps)
     rerun_hotels = bool(changed & hotels_deps)
@@ -298,427 +302,6 @@ def _normalize_dates_or_ask(travel_plan: TravelPlan) -> Tuple[bool, str]:
         "Example: '2026-04-10 to 2026-04-14' or 'depart 2026-04-10 for 4 days'."
     )
 
-
-# =============================================================================
-# Main node: call_model_node (PR2 Node1~Node4 internally)
-# =============================================================================
-
-async def call_model_node(state: TravelAgentState) -> Dict[str, Any]:
-    """
-    不改 graph、不改对外接口：仍然只有一个 node。
-    但内部逻辑按 Node1~Node4 分段组织，便于 PR3 再做自治循环。
-    """
-    print("━━━ NODE: Analysis & Execution (PR2 Node1-4) ━━━")
-
-    # ------------------------------
-    # 获取 last_user_text（必须最先做）
-    # ------------------------------
-    last_user_text = ""
-    try:
-        if state.get("messages"):
-            last_user_text = state["messages"][-1].content
-    except Exception:
-        last_user_text = ""
-
-    # ------------------------------
-    # one-way 检测：仅用于日志/解释
-    # 产品策略：强制往返
-    # ------------------------------
-    one_way_detected = _is_one_way_request(last_user_text)
-    one_way = False  # ✅ final execution policy (forced round-trip)
-
-    if one_way_detected:
-        print("→ one_way_detected=True, but product policy forces round-trip (one_way=False)")
-
-    # ------------------------------
-    # 低信息拦截
-    # ------------------------------
-    if _is_low_signal_user_input(last_user_text):
-        return {
-            "messages": [AIMessage(content="Sorry—I didn't catch that. Could you please repeat your request in English?")],
-            "current_step": "complete",
-            "form_to_display": None,
-            "one_way": one_way,
-            "one_way_detected": one_way_detected,
-            "last_tool_args": state.get("last_tool_args") or {},
-            "execution_plan": state.get("execution_plan"),
-        }
-
-    # =========================================================================
-    # Node1: ensure_customer_info
-    # =========================================================================
-    if not state.get("customer_info"):
-        original_request = state.get("original_request") or last_user_text
-        return {
-            "messages": [],
-            "current_step": "collecting_info",
-            "form_to_display": "customer_info",
-            "original_request": original_request,
-            "one_way": one_way,
-            "one_way_detected": one_way_detected,
-            "last_tool_args": state.get("last_tool_args") or {},
-            "execution_plan": {"decision": "ASK", "ask": "customer_info", "tasks": []},
-        }
-
-    customer_info = state.get("customer_info", {}) or {}
-
-    try:
-        # =========================================================================
-        # Node2: parse_or_update_plan
-        # =========================================================================
-        prev_plan: Optional[TravelPlan] = state.get("travel_plan")
-
-        if prev_plan is not None and _is_refresh_recommendation(last_user_text):
-            travel_plan = prev_plan
-            user_followup_hint = "refresh_recommendation"
-        else:
-            user_followup_hint = None
-            if prev_plan is None:
-                user_request = state.get("original_request") or last_user_text
-                travel_plan = await enhanced_travel_analysis(user_request)
-            else:
-                travel_plan = await update_travel_plan(prev_plan, last_user_text)
-
-        # update 后兜底（防 destination/origin 被清空）
-        if prev_plan is not None:
-            if getattr(travel_plan, "destination", None) in (None, ""):
-                travel_plan.destination = prev_plan.destination
-            if getattr(travel_plan, "origin", None) in (None, ""):
-                travel_plan.origin = prev_plan.origin
-
-
-        # ------------------------------
-        # NEW: deterministic intent override (防 LLM patch 把活动问询写成 full_plan)
-        # ------------------------------
-        override_intent = _infer_intent_override(last_user_text)
-        if override_intent and override_intent != travel_plan.user_intent:
-            old = travel_plan.user_intent
-            travel_plan.user_intent = override_intent
-            print(f"→ intent overridden by heuristics: {old} → {override_intent}")
-
-        # ------------------------------
-        # CHANGED: intent change cleanup（改成统一走 helper）
-        # ------------------------------
-        if prev_plan is not None:
-            prev_intent = prev_plan.user_intent
-            new_intent = travel_plan.user_intent
-            intent_changed = prev_intent != new_intent
-
-            if intent_changed:
-                changed = _changed_fields(prev_plan, travel_plan)
-                _cleanup_inherited_fields_on_intent(
-                    travel_plan,
-                    new_intent,
-                    changed_fields=changed,
-                    user_text=last_user_text,
-                )
-
-
-        # CHANGED: 只有需要航班时才默认 origin
-        if travel_plan.user_intent in ["full_plan", "flights_only"] and not travel_plan.origin:
-            travel_plan.origin = "Shanghai"
-            print("→ Origin not provided, defaulting to Shanghai")
-
-
-        # =========================================================================
-        # Node3: ask_missing_core_fields (destination / dates)
-        #   - PR2：缺日期优先追问（不再默认 15 天后）
-        # =========================================================================
-        needs_dates = travel_plan.user_intent in ["full_plan", "flights_only", "hotels_only"]
-
-        if needs_dates:
-            ok, ask_msg = _normalize_dates_or_ask(travel_plan)
-            if not ok:
-                return {
-                    "messages": [AIMessage(content=ask_msg)],
-                    "current_step": "complete",
-                    "form_to_display": None,
-                    "travel_plan": travel_plan,
-                    "one_way": one_way,
-                    "one_way_detected": one_way_detected,
-                    "last_tool_args": state.get("last_tool_args") or {},
-                    "user_followup_hint": user_followup_hint,
-                    "execution_plan": {"decision": "ASK", "ask": ask_msg, "intent": travel_plan.user_intent, "tasks": []},
-                }
-        else:
-            # activities_only：只需 destination
-            if not getattr(travel_plan, "destination", None):
-                ask_msg = "Where are you traveling to (destination city/airport)?"
-                return {
-                    "messages": [AIMessage(content=ask_msg)],
-                    "current_step": "complete",
-                    "form_to_display": None,
-                    "travel_plan": travel_plan,
-                    "one_way": one_way,
-                    "one_way_detected": one_way_detected,
-                    "last_tool_args": state.get("last_tool_args") or {},
-                    "user_followup_hint": user_followup_hint,
-                    "execution_plan": {"decision": "ASK", "ask": ask_msg, "intent": travel_plan.user_intent, "tasks": []},
-                }
-
-        # =========================================================================
-        # Diff / rerun flags
-        # =========================================================================
-        rerun_flights, rerun_hotels, rerun_activities = _compute_rerun_flags(prev_plan, travel_plan)
-        intent = travel_plan.user_intent if travel_plan else "full_plan"
-
-        # ✅ effective rerun：只表示“本轮真的会执行的工具”
-        eff_rerun_flights = rerun_flights and intent in ["full_plan", "flights_only"]
-        eff_rerun_hotels = rerun_hotels and intent in ["full_plan", "hotels_only"]
-        eff_rerun_activities = rerun_activities and intent in ["full_plan", "activities_only"]
-
-        print(f"→ Rerun flags (raw): flights={rerun_flights}, hotels={rerun_hotels}, activities={rerun_activities}")
-        print(f"→ Rerun flags (effective): flights={eff_rerun_flights}, hotels={eff_rerun_hotels}, activities={eff_rerun_activities}")
-
-        reuse_tools = {
-            "flights_only": ["search_flights"],
-            "hotels_only": ["search_and_compare_hotels"],
-            "activities_only": ["search_activities_by_city"],
-            "full_plan": ["search_flights", "search_and_compare_hotels", "search_activities_by_city"],
-        }.get(intent, [])
-
-        # =========================================================================
-        # Node4: build_execution_plan
-        # =========================================================================
-        planned_tasks: List[str] = []
-        if eff_rerun_flights:
-            planned_tasks.append("search_flights")
-        if eff_rerun_hotels:
-            planned_tasks.append("search_and_compare_hotels")
-        if eff_rerun_activities:
-            planned_tasks.append("search_activities_by_city")
-
-        execution_plan = {"decision": "EXECUTE", "intent": intent, "tasks": planned_tasks}
-
-        # ---------------------------------------------------------------------
-        # 准备工具 + 复用 + 串行执行
-        # ---------------------------------------------------------------------
-        tasks_and_names: List[tuple[Awaitable, str, Dict[str, Any]]] = []
-
-        departure_date = travel_plan.departure_date
-        return_date = travel_plan.return_date
-
-        raw_origin = travel_plan.origin
-        raw_dest = travel_plan.destination
-
-        key_args_update: Dict[str, Dict[str, Any]] = {}
-
-        # ---- flights ----
-        if eff_rerun_flights and raw_origin and raw_dest and departure_date:
-            from .location_utils import location_to_airport_code
-            from .config import amadeus as amadeus_client
-
-            origin_iata = await location_to_airport_code(amadeus_client, raw_origin)
-            dest_iata = await location_to_airport_code(amadeus_client, raw_dest)
-
-            flight_args = {
-                "originLocationCode": origin_iata,
-                "destinationLocationCode": dest_iata,
-                "departureDate": departure_date,
-                "returnDate": return_date,
-                "adults": travel_plan.adults,
-                "currencyCode": "USD",
-                "travelClass": travel_plan.travel_class,
-                "departureTime": travel_plan.departure_time_pref,
-                "arrivalTime": travel_plan.arrival_time_pref,
-            }
-            tasks_and_names.append((search_flights.ainvoke(flight_args), "search_flights", flight_args))
-
-            # ✅ key 用语义参数（raw_origin/raw_dest），one_way 用最终执行策略（forced round-trip）
-            key_args_update["search_flights"] = {
-                "originLocationCode": raw_origin,
-                "destinationLocationCode": raw_dest,
-                "departureDate": departure_date,
-                "returnDate": return_date,
-                "adults": travel_plan.adults,
-                "travelClass": travel_plan.travel_class,
-                "departureTime": travel_plan.departure_time_pref,
-                "arrivalTime": travel_plan.arrival_time_pref,
-                "one_way": one_way,
-            }
-
-        # ---- hotels ----
-        if eff_rerun_hotels and raw_dest and departure_date and return_date:
-            hotel_args = {
-                "city_code": raw_dest,
-                "check_in_date": departure_date,
-                "check_out_date": return_date,
-                "adults": travel_plan.adults,
-            }
-            tasks_and_names.append((search_and_compare_hotels.ainvoke(hotel_args), "search_and_compare_hotels", hotel_args))
-
-            key_args_update["search_and_compare_hotels"] = {
-                "city_code": raw_dest,
-                "check_in_date": departure_date,
-                "check_out_date": return_date,
-                "adults": travel_plan.adults,
-            }
-
-        # ---- activities ----
-        if eff_rerun_activities and raw_dest:
-            act_args = {"city_name": raw_dest}
-            tasks_and_names.append((search_activities_by_city.ainvoke(act_args), "search_activities_by_city", act_args))
-            key_args_update["search_activities_by_city"] = {"city_name": raw_dest}
-
-        # 合并 last_tool_args（并按 intent 过滤，避免无关缓存污染）
-        allowed_tools_for_intent = {
-            "flights_only": {"search_flights"},
-            "hotels_only": {"search_and_compare_hotels"},
-            "activities_only": {"search_activities_by_city"},
-            "full_plan": {"search_flights", "search_and_compare_hotels", "search_activities_by_city"},
-        }.get(intent, set())
-
-        prev_last_args = state.get("last_tool_args") or {}
-        prev_last_args = {k: v for k, v in prev_last_args.items() if k in allowed_tools_for_intent}
-
-        merged_last_args = dict(prev_last_args)
-        merged_last_args.update(key_args_update)
-
-        # 工具复用入口
-        has_any_tool_history = any(isinstance(m, ToolMessage) for m in state.get("messages", []))
-
-        if not tasks_and_names:
-            if has_any_tool_history:
-                print("→ No tools needed this turn; reusing previous tool results")
-                return {
-                    "messages": [],
-                    "current_step": "synthesizing",
-                    "travel_plan": travel_plan,
-                    "form_to_display": None,
-                    "tools_used": reuse_tools,
-                    "one_way": one_way,
-                    "one_way_detected": one_way_detected,
-                    "last_tool_args": merged_last_args,
-                    "user_followup_hint": user_followup_hint,
-                    "execution_plan": {**execution_plan, "tasks": []},
-                }
-
-            return {
-                "messages": [AIMessage(content="I've understood your request, but there's no specific search I can perform. How else can I help?")],
-                "current_step": "complete",
-                "travel_plan": travel_plan,
-                "form_to_display": None,
-                "one_way": one_way,
-                "one_way_detected": one_way_detected,
-                "last_tool_args": merged_last_args,
-                "user_followup_hint": user_followup_hint,
-                "execution_plan": {**execution_plan, "tasks": []},
-            }
-
-        # 串行执行工具
-        print(f"→ Phase: Executing {len(tasks_and_names)} tools sequentially (rate-limit safe)")
-        processed_messages: List[ToolMessage] = []
-
-        def _tool_error_placeholder(tool_name: str, err: Exception) -> str:
-            msg = f"{type(err).__name__}: {err}"
-            msg = (msg[:500] + "…") if len(msg) > 500 else msg
-
-            if tool_name == "search_flights":
-                payload = [{
-                    "airline": "API_ERROR",
-                    "price": "N/A",
-                    "departure_time": "N/A",
-                    "arrival_time": "N/A",
-                    "duration": None,
-                    "is_error": True,
-                    "error_message": msg,
-                }]
-            elif tool_name == "search_and_compare_hotels":
-                payload = [{
-                    "name": "API_ERROR",
-                    "category": "N/A",
-                    "price_per_night": "N/A",
-                    "source": "SYSTEM",
-                    "rating": None,
-                    "is_error": True,
-                    "error_message": msg,
-                }]
-            elif tool_name == "search_activities_by_city":
-                payload = [{
-                    "name": "API_ERROR",
-                    "description": "Activity API error",
-                    "price": "N/A",
-                    "location": None,
-                    "is_error": True,
-                    "error_message": msg,
-                }]
-            else:
-                payload = [{"is_error": True, "error_message": msg}]
-
-            return json.dumps(payload, ensure_ascii=False)
-
-        for i, (task_coro, tool_name, tool_args) in enumerate(tasks_and_names):
-            print(f"→ [{i+1}/{len(tasks_and_names)}] Running tool: {tool_name}")
-
-            key_kwargs = dict((merged_last_args or {}).get(tool_name, {}) or {})
-            if tool_name == "search_flights":
-                key_kwargs["one_way"] = one_way  # ✅ use final policy only
-
-            current_tool_key = _compute_tool_key(tool_name, travel_plan, **key_kwargs)
-
-            try:
-                result = await task_coro
-                try:
-                    content = json.dumps([item.model_dump() for item in result], ensure_ascii=False)
-                except Exception as e:
-                    print(f"✗ Serialization failed for {tool_name}: {e}")
-                    content = _tool_error_placeholder(tool_name, e)
-            except Exception as e:
-                print(f"✗ Tool {tool_name} failed: {e}")
-                content = _tool_error_placeholder(tool_name, e)
-
-            processed_messages.append(
-                ToolMessage(
-                    content=content,
-                    name=tool_name,
-                    tool_call_id=f"call_{tool_name}:{current_tool_key}:{i}",
-                )
-            )
-
-            if i < len(tasks_and_names) - 1:
-                await asyncio.sleep(1.2)
-
-        print("✓ All tools executed")
-
-        return {
-            "messages": processed_messages,
-            "current_step": "synthesizing",
-            "travel_plan": travel_plan,
-            "form_to_display": None,
-            "tools_used": reuse_tools,
-            "one_way": one_way,
-            "one_way_detected": one_way_detected,
-            "last_tool_args": merged_last_args,
-            "user_followup_hint": user_followup_hint,
-            "execution_plan": execution_plan,
-        }
-
-    except (ValueError, ValidationError) as e:
-        print(f"✗ Analysis failed: {e}")
-        return {
-            "messages": [AIMessage(content="I'm sorry, I had trouble understanding your request. Could you rephrase it?")],
-            "current_step": "complete",
-            "form_to_display": None,
-            "one_way": one_way,
-            "one_way_detected": one_way_detected,
-            "last_tool_args": state.get("last_tool_args") or {},
-            "execution_plan": state.get("execution_plan"),
-        }
-
-    except Exception as e:
-        print(f"✗ Unexpected error: {e}")
-        return {
-            "messages": [AIMessage(content="I apologize, but a system error occurred. Please try again.")],
-            "current_step": "complete",
-            "form_to_display": None,
-            "one_way": one_way,
-            "one_way_detected": one_way_detected,
-            "last_tool_args": state.get("last_tool_args") or {},
-            "execution_plan": state.get("execution_plan"),
-        }
-
-
-
 # ------------------------------------------------------------------------------
 # Budget helpers（保持你原实现）
 # ------------------------------------------------------------------------------
@@ -824,16 +407,14 @@ def _cleanup_inherited_fields_on_intent(
 def _parse_budget_to_float(raw: object) -> Optional[float]:
     if raw is None:
         return None
+    from .currency import parse_price_to_usd
     s = str(raw).strip()
     if not s:
         return None
-    s = s.upper().replace("USD", "").replace("$", "").replace(",", "").strip()
-    m = re.search(r"\d+(\.\d+)?", s)
-    if not m:
-        return None
     try:
-        return float(m.group(0))
-    except ValueError:
+        usd = parse_price_to_usd(s)
+        return float(usd) if usd is not None else None
+    except Exception:
         return None
 
 
@@ -847,6 +428,471 @@ def _ensure_budget_for_packages(travel_plan: TravelPlan, customer_info: dict) ->
         return fallback
 
     return None
+
+
+# =============================================================================
+# Multi-node LangGraph nodes (production path)
+# =============================================================================
+
+async def ensure_customer_info_node(state: TravelAgentState) -> Dict[str, Any]:
+    """Node: low-signal guard + HITL customer_info via LangGraph interrupt/resume."""
+
+    last_user_text = ""
+    try:
+        if state.get("messages"):
+            last_user_text = state["messages"][-1].content
+    except Exception:
+        last_user_text = ""
+
+    one_way_detected = _is_one_way_request(last_user_text)
+    one_way = False  # product policy: force round-trip
+
+    if _is_low_signal_user_input(last_user_text):
+        return {
+            "messages": [AIMessage(content="Sorry—I didn't catch that. Could you please repeat your request in English?")],
+            "current_step": "complete",
+            "form_to_display": None,
+            "customer_info": state.get("customer_info") or {},
+            "one_way": one_way,
+            "one_way_detected": one_way_detected,
+            "last_tool_args": state.get("last_tool_args") or {},
+            "execution_plan": state.get("execution_plan"),
+        }
+
+    customer_info = state.get("customer_info") or {}
+    if not customer_info:
+        payload = {
+            "type": "form",
+            "form": "customer_info",
+            "title": "Please enter your information to plan your trip",
+            "fields": [
+                {"name": "name", "label": "Full name"},
+                {"name": "email", "label": "Email"},
+                {"name": "phone", "label": "Phone"},
+                {"name": "budget", "label": "Budget"},
+            ],
+        }
+
+        resume_value = interrupt(payload)
+        if not isinstance(resume_value, dict):
+            raise TypeError(
+                "Expected customer_info resume payload to be a dict, got "
+                f"{type(resume_value).__name__}: {resume_value!r}"
+            )
+        customer_info = resume_value
+
+    return {
+        "messages": [],
+        "current_step": "continue",
+        "form_to_display": None,
+        "customer_info": customer_info,
+        "one_way": one_way,
+        "one_way_detected": one_way_detected,
+    }
+
+
+async def parse_or_update_plan_node(state: TravelAgentState) -> Dict[str, Any]:
+    """Node: build/update TravelPlan and apply deterministic cleanups."""
+
+    last_user_text = ""
+    try:
+        if state.get("messages"):
+            last_user_text = state["messages"][-1].content
+    except Exception:
+        last_user_text = ""
+
+    one_way = bool(state.get("one_way", False))
+    one_way_detected = bool(state.get("one_way_detected", False))
+    customer_info = state.get("customer_info") or {}
+
+    prev_plan: Optional[TravelPlan] = state.get("travel_plan")
+
+    if prev_plan is not None and _is_refresh_recommendation(last_user_text):
+        travel_plan = prev_plan
+        user_followup_hint = "refresh_recommendation"
+    else:
+        user_followup_hint = None
+        try:
+            if prev_plan is None:
+                user_request = state.get("original_request") or last_user_text
+                travel_plan = await enhanced_travel_analysis(user_request)
+            else:
+                travel_plan = await update_travel_plan(prev_plan, last_user_text)
+        except Exception:
+            clarification = (
+                "I can help plan the trip, but I still need your destination (city/country). "
+                "For example: 'Tokyo', 'Paris', or 'Bangkok'."
+            )
+            return {
+                "messages": [AIMessage(content=clarification)],
+                "current_step": "complete",
+                "form_to_display": None,
+                "customer_info": customer_info,
+                "one_way": one_way,
+                "one_way_detected": one_way_detected,
+                "last_tool_args": state.get("last_tool_args") or {},
+                "user_followup_hint": user_followup_hint,
+                "execution_plan": {"decision": "ASK", "ask": clarification, "intent": "full_plan", "tasks": []},
+            }
+
+    # update 后兜底（防 destination/origin 被清空）
+    if prev_plan is not None:
+        if getattr(travel_plan, "destination", None) in (None, ""):
+            travel_plan.destination = prev_plan.destination
+        if getattr(travel_plan, "origin", None) in (None, ""):
+            travel_plan.origin = prev_plan.origin
+
+    override_intent = _infer_intent_override(last_user_text)
+    if override_intent and override_intent != travel_plan.user_intent:
+        old = travel_plan.user_intent
+        travel_plan.user_intent = override_intent
+        print(f"→ intent overridden by heuristics: {old} → {override_intent}")
+
+    if prev_plan is not None:
+        prev_intent = prev_plan.user_intent
+        new_intent = travel_plan.user_intent
+        if prev_intent != new_intent:
+            changed = _changed_fields(prev_plan, travel_plan)
+            _cleanup_inherited_fields_on_intent(
+                travel_plan,
+                new_intent,
+                changed_fields=changed,
+                user_text=last_user_text,
+            )
+
+    if travel_plan.user_intent in ["full_plan", "flights_only"] and not travel_plan.origin:
+        travel_plan.origin = "Shanghai"
+        print("→ Origin not provided, defaulting to Shanghai")
+
+    return {
+        "messages": [],
+        "current_step": "continue",
+        "_prev_travel_plan": prev_plan,
+        "travel_plan": travel_plan,
+        "customer_info": customer_info,
+        "one_way": one_way,
+        "one_way_detected": one_way_detected,
+        "user_followup_hint": user_followup_hint,
+    }
+
+
+async def ask_missing_core_fields_node(state: TravelAgentState) -> Dict[str, Any]:
+    """Node: date gate and destination/date clarification (ASK)."""
+
+    travel_plan: Optional[TravelPlan] = state.get("travel_plan")
+    customer_info = state.get("customer_info") or {}
+    one_way = bool(state.get("one_way", False))
+    one_way_detected = bool(state.get("one_way_detected", False))
+    user_followup_hint = state.get("user_followup_hint")
+
+    if travel_plan is None:
+        return {
+            "messages": [AIMessage(content="I'm sorry, I had trouble understanding your request. Could you rephrase it?")],
+            "current_step": "complete",
+            "form_to_display": None,
+            "customer_info": customer_info,
+            "one_way": one_way,
+            "one_way_detected": one_way_detected,
+            "last_tool_args": state.get("last_tool_args") or {},
+            "execution_plan": state.get("execution_plan"),
+        }
+
+    needs_dates = travel_plan.user_intent in ["full_plan", "flights_only", "hotels_only"]
+    if needs_dates:
+        ok, ask_msg = _normalize_dates_or_ask(travel_plan)
+        if not ok:
+            return {
+                "messages": [AIMessage(content=ask_msg)],
+                "current_step": "complete",
+                "form_to_display": None,
+                "travel_plan": travel_plan,
+                "customer_info": customer_info,
+                "one_way": one_way,
+                "one_way_detected": one_way_detected,
+                "last_tool_args": state.get("last_tool_args") or {},
+                "user_followup_hint": user_followup_hint,
+                "execution_plan": {"decision": "ASK", "ask": ask_msg, "intent": travel_plan.user_intent, "tasks": []},
+            }
+    else:
+        if not getattr(travel_plan, "destination", None):
+            ask_msg = "Where are you traveling to (destination city/airport)?"
+            return {
+                "messages": [AIMessage(content=ask_msg)],
+                "current_step": "complete",
+                "form_to_display": None,
+                "travel_plan": travel_plan,
+                "customer_info": customer_info,
+                "one_way": one_way,
+                "one_way_detected": one_way_detected,
+                "last_tool_args": state.get("last_tool_args") or {},
+                "user_followup_hint": user_followup_hint,
+                "execution_plan": {"decision": "ASK", "ask": ask_msg, "intent": travel_plan.user_intent, "tasks": []},
+            }
+
+    return {
+        "messages": [],
+        "current_step": "continue",
+        "travel_plan": travel_plan,
+        "customer_info": customer_info,
+        "one_way": one_way,
+        "one_way_detected": one_way_detected,
+        "user_followup_hint": user_followup_hint,
+        "last_tool_args": state.get("last_tool_args") or {},
+    }
+
+
+async def execute_tools_node(state: TravelAgentState) -> Dict[str, Any]:
+    """Node: compute rerun flags, run tools (sequential), emit ToolMessages, or reuse."""
+
+    travel_plan: Optional[TravelPlan] = state.get("travel_plan")
+    customer_info = state.get("customer_info") or {}
+    one_way = bool(state.get("one_way", False))
+    one_way_detected = bool(state.get("one_way_detected", False))
+    user_followup_hint = state.get("user_followup_hint")
+
+    if travel_plan is None:
+        return {
+            "messages": [AIMessage(content="I'm sorry, I had trouble understanding your request. Could you rephrase it?")],
+            "current_step": "complete",
+            "form_to_display": None,
+            "customer_info": customer_info,
+            "one_way": one_way,
+            "one_way_detected": one_way_detected,
+            "last_tool_args": state.get("last_tool_args") or {},
+            "execution_plan": state.get("execution_plan"),
+        }
+
+    prev_plan: Optional[TravelPlan] = state.get("_prev_travel_plan")
+    rerun_flights, rerun_hotels, rerun_activities = _compute_rerun_flags(prev_plan, travel_plan)
+
+    intent = travel_plan.user_intent
+    existing_tool_names = {m.name for m in (state.get("messages", []) or []) if isinstance(m, ToolMessage)}
+
+    needs_flights_tool = intent in ["full_plan", "flights_only"]
+    needs_hotels_tool = intent in ["full_plan", "hotels_only"]
+    needs_activities_tool = intent in ["full_plan", "activities_only"]
+
+    force_first_run_flights = needs_flights_tool and "search_flights" not in existing_tool_names
+    force_first_run_hotels = needs_hotels_tool and "search_and_compare_hotels" not in existing_tool_names
+    force_first_run_activities = needs_activities_tool and "search_activities_by_city" not in existing_tool_names
+
+    eff_rerun_flights = (rerun_flights or force_first_run_flights) and needs_flights_tool
+    eff_rerun_hotels = (rerun_hotels or force_first_run_hotels) and needs_hotels_tool
+    eff_rerun_activities = (rerun_activities or force_first_run_activities) and needs_activities_tool
+
+    print(f"→ Rerun flags (raw): flights={rerun_flights}, hotels={rerun_hotels}, activities={rerun_activities}")
+    print(f"→ Rerun flags (effective): flights={eff_rerun_flights}, hotels={eff_rerun_hotels}, activities={eff_rerun_activities}")
+
+    reuse_tools = {
+        "flights_only": ["search_flights"],
+        "hotels_only": ["search_and_compare_hotels"],
+        "activities_only": ["search_activities_by_city"],
+        "full_plan": ["search_flights", "search_and_compare_hotels", "search_activities_by_city"],
+    }.get(intent, [])
+
+    planned_tasks: List[str] = []
+    if eff_rerun_flights:
+        planned_tasks.append("search_flights")
+    if eff_rerun_hotels:
+        planned_tasks.append("search_and_compare_hotels")
+    if eff_rerun_activities:
+        planned_tasks.append("search_activities_by_city")
+
+    execution_plan = {"decision": "EXECUTE", "intent": intent, "tasks": planned_tasks}
+
+    tasks_and_names: List[tuple[Awaitable, str, Dict[str, Any]]] = []
+
+    departure_date = travel_plan.departure_date
+    return_date = travel_plan.return_date
+    raw_origin = travel_plan.origin
+    raw_dest = travel_plan.destination
+
+    key_args_update: Dict[str, Dict[str, Any]] = {}
+
+    if eff_rerun_flights and raw_origin and raw_dest and departure_date:
+        from .location_utils import location_to_airport_code
+        from .config import amadeus as amadeus_client
+
+        origin_iata = await location_to_airport_code(amadeus_client, raw_origin)
+        dest_iata = await location_to_airport_code(amadeus_client, raw_dest)
+
+        flight_args = {
+            "originLocationCode": origin_iata,
+            "destinationLocationCode": dest_iata,
+            "departureDate": departure_date,
+            "returnDate": None if one_way else return_date,
+            "adults": travel_plan.adults,
+            "travelClass": travel_plan.travel_class,
+            "departureTime": travel_plan.departure_time_pref,
+            "arrivalTime": travel_plan.arrival_time_pref,
+            "one_way": one_way,
+        }
+        tasks_and_names.append((search_flights.ainvoke(flight_args), "search_flights", flight_args))
+
+        key_args_update["search_flights"] = {
+            "originLocationCode": raw_origin,
+            "destinationLocationCode": raw_dest,
+            "departureDate": departure_date,
+            "returnDate": None if one_way else return_date,
+            "adults": travel_plan.adults,
+            "travelClass": travel_plan.travel_class,
+            "departureTime": travel_plan.departure_time_pref,
+            "arrivalTime": travel_plan.arrival_time_pref,
+            "one_way": one_way,
+        }
+
+    if eff_rerun_hotels and raw_dest and departure_date and return_date:
+        hotel_args = {
+            "city_code": raw_dest,
+            "check_in_date": departure_date,
+            "check_out_date": return_date,
+            "adults": travel_plan.adults,
+        }
+        tasks_and_names.append((search_and_compare_hotels.ainvoke(hotel_args), "search_and_compare_hotels", hotel_args))
+
+        key_args_update["search_and_compare_hotels"] = {
+            "city_code": raw_dest,
+            "check_in_date": departure_date,
+            "check_out_date": return_date,
+            "adults": travel_plan.adults,
+        }
+
+    if eff_rerun_activities and raw_dest:
+        act_args = {"city_name": raw_dest}
+        tasks_and_names.append((search_activities_by_city.ainvoke(act_args), "search_activities_by_city", act_args))
+        key_args_update["search_activities_by_city"] = {"city_name": raw_dest}
+
+    allowed_tools_for_intent = {
+        "flights_only": {"search_flights"},
+        "hotels_only": {"search_and_compare_hotels"},
+        "activities_only": {"search_activities_by_city"},
+        "full_plan": {"search_flights", "search_and_compare_hotels", "search_activities_by_city"},
+    }.get(intent, set())
+
+    prev_last_args = state.get("last_tool_args") or {}
+    prev_last_args = {k: v for k, v in prev_last_args.items() if k in allowed_tools_for_intent}
+    merged_last_args = dict(prev_last_args)
+    merged_last_args.update(key_args_update)
+
+    has_any_tool_history = any(isinstance(m, ToolMessage) for m in state.get("messages", []))
+
+    if not tasks_and_names:
+        if has_any_tool_history:
+            print("→ No tools needed this turn; reusing previous tool results")
+            return {
+                "messages": [],
+                "current_step": "synthesizing",
+                "travel_plan": travel_plan,
+                "form_to_display": None,
+                "tools_used": reuse_tools,
+                "customer_info": customer_info,
+                "one_way": one_way,
+                "one_way_detected": one_way_detected,
+                "last_tool_args": merged_last_args,
+                "user_followup_hint": user_followup_hint,
+                "execution_plan": {**execution_plan, "tasks": []},
+            }
+
+        return {
+            "messages": [AIMessage(content="I've understood your request, but there's no specific search I can perform. How else can I help?")],
+            "current_step": "complete",
+            "travel_plan": travel_plan,
+            "form_to_display": None,
+            "customer_info": customer_info,
+            "one_way": one_way,
+            "one_way_detected": one_way_detected,
+            "last_tool_args": merged_last_args,
+            "user_followup_hint": user_followup_hint,
+            "execution_plan": {**execution_plan, "tasks": []},
+        }
+
+    print(f"→ Phase: Executing {len(tasks_and_names)} tools sequentially (rate-limit safe)")
+    processed_messages: List[ToolMessage] = []
+
+    def _tool_error_placeholder(tool_name: str, err: Exception) -> str:
+        msg = f"{type(err).__name__}: {err}"
+        msg = (msg[:500] + "…") if len(msg) > 500 else msg
+
+        if tool_name == "search_flights":
+            payload = [{
+                "airline": "API_ERROR",
+                "price": "N/A",
+                "departure_time": "N/A",
+                "arrival_time": "N/A",
+                "duration": None,
+                "is_error": True,
+                "error_message": msg,
+            }]
+        elif tool_name == "search_and_compare_hotels":
+            payload = [{
+                "name": "API_ERROR",
+                "category": "N/A",
+                "price_per_night": "N/A",
+                "source": "SYSTEM",
+                "rating": None,
+                "is_error": True,
+                "error_message": msg,
+            }]
+        elif tool_name == "search_activities_by_city":
+            payload = [{
+                "name": "API_ERROR",
+                "description": "Activity API error",
+                "price": "N/A",
+                "location": None,
+                "is_error": True,
+                "error_message": msg,
+            }]
+        else:
+            payload = [{"is_error": True, "error_message": msg}]
+
+        return json.dumps(payload, ensure_ascii=False)
+
+    for i, (task_coro, tool_name, _tool_args) in enumerate(tasks_and_names):
+        print(f"→ [{i+1}/{len(tasks_and_names)}] Running tool: {tool_name}")
+
+        key_kwargs = dict((merged_last_args or {}).get(tool_name, {}) or {})
+        if tool_name == "search_flights":
+            key_kwargs["one_way"] = one_way
+
+        current_tool_key = _compute_tool_key(tool_name, travel_plan, **key_kwargs)
+
+        try:
+            result = await task_coro
+            try:
+                content = json.dumps([item.model_dump() for item in result], ensure_ascii=False)
+            except Exception as e:
+                print(f"✗ Serialization failed for {tool_name}: {e}")
+                content = _tool_error_placeholder(tool_name, e)
+        except Exception as e:
+            print(f"✗ Tool {tool_name} failed: {e}")
+            content = _tool_error_placeholder(tool_name, e)
+
+        processed_messages.append(
+            ToolMessage(
+                content=content,
+                name=tool_name,
+                tool_call_id=f"call_{tool_name}:{current_tool_key}:{i}",
+            )
+        )
+
+        if i < len(tasks_and_names) - 1:
+            await asyncio.sleep(1.2)
+
+    print("✓ All tools executed")
+
+    return {
+        "messages": processed_messages,
+        "current_step": "synthesizing",
+        "travel_plan": travel_plan,
+        "form_to_display": None,
+        "tools_used": reuse_tools,
+        "customer_info": customer_info,
+        "one_way": one_way,
+        "one_way_detected": one_way_detected,
+        "last_tool_args": merged_last_args,
+        "user_followup_hint": user_followup_hint,
+        "execution_plan": execution_plan,
+    }
 
 
 # ------------------------------------------------------------------------------
